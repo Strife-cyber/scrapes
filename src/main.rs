@@ -8,7 +8,8 @@ mod downloader;
 
 use downloader::*;
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let task = DownloadTask {
         url: "https://example.com/file.zip".to_string(),
         output: "file.zip".into(),
@@ -21,7 +22,12 @@ fn main() {
     let chunks = manager.prepare(&task).expect("prepare failed");
 
     println!("Prepared {} chunks:", chunks.len());
-    for c in chunks {
+    for c in &chunks {
         println!("{:?}", c);
+    }
+
+    // Démarrer le téléchargement réel
+    if let Err(e) = manager.start(task).await {
+        eprintln!("Erreur de téléchargement: {:#}", e);
     }
 }

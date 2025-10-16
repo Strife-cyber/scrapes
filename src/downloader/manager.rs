@@ -8,7 +8,14 @@
 //! - Chaque fichier de chunk est pré‑alloué à la taille exacte de son segment
 //!   pour éviter des réallocations et garantir des écritures positionnées efficaces.
 use std::{io};
-use crate::downloader::{create_empty_file, Chunk, DownloadTask};
+use crate::downloader::{create_empty_file, merge_chunks, DownloadTask};
+use crate::downloader::Chunk;
+use anyhow::{Context, Result};
+use reqwest::header::{ACCEPT_RANGES, CONTENT_LENGTH, RANGE};
+use reqwest::Client;
+use futures::stream::{self, StreamExt};
+use tokio::io::{AsyncWriteExt};
+use tokio::fs::{OpenOptions};
 
 pub struct DownloadManager;
 
@@ -38,15 +45,124 @@ impl DownloadManager {
         Ok(chunks)
     }
 
-    /// Démarre la procédure de téléchargement (placeholder pour l'instant).
+    /// Démarre un téléchargement parallèle par plages HTTP (`Range`).
     ///
-    /// À implémenter:
-    /// - Planification des requêtes parallèles avec en‑têtes `Range`.
-    /// - Reprise sur erreur et validation des tailles reçues.
-    pub fn start(&self, _task: DownloadTask) -> io::Result<()> {
-        println!("Starting download for {:?}", _task.url);
+    /// Stratégie:
+    /// - Détecte `content-length` et support `accept-ranges` via HEAD si nécessaire.
+    /// - Prépare les fichiers de parties pour chaque segment.
+    /// - Télécharge les segments en parallèle avec une limite de concurrence.
+    /// - Fusionne les parties en un fichier final à la fin.
+    pub async fn start(&self, mut task: DownloadTask) -> Result<()> {
+        let client = Client::builder().build().context("Créer client HTTP")?;
+
+        // Déterminer la taille et le support des ranges si absent
+        let (total_size, supports_range) = self
+            .detect_remote_metadata(&client, &task)
+            .await
+            .context("Détecter métadonnées distantes")?;
+        task.total_size = total_size;
+
+        // Si le serveur ne supporte pas les ranges, télécharger en 1 requête
+        if !supports_range {
+            self.download_whole(&client, &task).await?;
+            return Ok(());
+        }
+
+        // Préparer les chunks et fichiers
+        let chunks = self.prepare(&task).context("Préparer chunks")?;
+
+        // Concurrence bornée
+        let max_concurrency = 6usize;
+
+        let url = task.url.clone();
+        stream::iter(chunks.clone())
+            .map(|chunk| {
+                let client = client.clone();
+                let url = url.clone();
+                async move {
+                    if let Err(e) = download_chunk(&client, &url, &chunk).await {
+                        Err(anyhow::anyhow!("chunk {}: {}", chunk.index, e))
+                    } else {
+                        Ok(())
+                    }
+                }
+            })
+            .buffer_unordered(max_concurrency)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Fusion des fichiers partiels
+        let part_paths: Vec<_> = chunks.iter().map(|c| c.path.as_path()).collect();
+        merge_chunks(&part_paths, &task.output).context("Fusionner chunks")?;
         Ok(())
     }
+
+    /// Effectue une requête HEAD pour récupérer `content-length` et `accept-ranges`.
+    async fn detect_remote_metadata(&self, client: &Client, task: &DownloadTask) -> Result<(u64, bool)> {
+        if task.total_size > 0 {
+            // On connaît déjà la taille; supposer support des ranges et laisser le serveur répondre 206
+            return Ok((task.total_size, true));
+        }
+
+        let resp = client.head(&task.url).send().await.context("HEAD request")?;
+        resp.error_for_status_ref().context("HEAD status")?;
+
+        let len = resp
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .context("En‑tête content-length manquant/invalide")?;
+
+        let supports_range = resp
+            .headers()
+            .get(ACCEPT_RANGES)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.eq_ignore_ascii_case("bytes"))
+            .unwrap_or(false);
+
+        Ok((len, supports_range))
+    }
+
+    /// Télécharge tout le fichier en une seule requête (fallback sans `Range`).
+    async fn download_whole(&self, client: &Client, task: &DownloadTask) -> Result<()> {
+        let resp = client.get(&task.url).send().await.context("GET complet")?;
+        let mut resp = resp.error_for_status().context("GET status")?;
+
+        // Écrire directement dans le fichier final
+        let mut file = OpenOptions::new().create(true).truncate(true).write(true).open(&task.output).await?;
+        while let Some(chunk) = resp.chunk().await.context("Lire chunk HTTP")? {
+            file.write_all(&chunk).await?;
+        }
+        file.flush().await?;
+        Ok(())
+    }
+}
+
+/// Télécharge un segment unique via HTTP `Range` et l'écrit dans le fichier part.
+async fn download_chunk(client: &Client, url: &str, chunk: &Chunk) -> Result<()> {
+    let range_header = format!("bytes={}-{}", chunk.start, chunk.end);
+    let resp = client
+        .get(url)
+        .header(RANGE, range_header)
+        .send()
+        .await
+        .context("GET range")?;
+
+    // 206 attendu pour une réponse de plage partielle
+    let mut resp = resp.error_for_status().context("GET status")?;
+
+    // Ouvrir le fichier part et écrire en flux
+    let part_path = &chunk.path;
+    let mut file = OpenOptions::new().write(true).truncate(true).open(part_path).await?;
+
+    while let Some(bytes) = resp.chunk().await.context("Lire chunk HTTP")? {
+        file.write_all(&bytes).await?;
+    }
+    file.flush().await?;
+    Ok(())
 }
 
 
@@ -56,6 +172,12 @@ mod tests {
     use crate::downloader::{Chunk, DownloadTask};
     use tempfile::tempdir;
     use std::fs;
+    use std::net::TcpListener as StdTcpListener;
+    use hyper::{Body, Request, Response, Server, Method};
+    use hyper::service::{make_service_fn, service_fn};
+    use hyper::header::{CONTENT_LENGTH as H_CONTENT_LENGTH, CONTENT_RANGE as H_CONTENT_RANGE, RANGE as H_RANGE, ACCEPT_RANGES as H_ACCEPT_RANGES};
+    use hyper::StatusCode;
+    use tokio::sync::oneshot;
 
     #[test]
     fn test_prepare_creates_chunks_and_files() {
@@ -139,5 +261,126 @@ mod tests {
 
         // No chunks should be returned
         assert!(chunks.is_empty());
+    }
+
+    async fn start_test_server(data: Vec<u8>, support_range: bool) -> (String, oneshot::Sender<()>) {
+        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = oneshot::channel::<()>();
+
+        let make_svc = make_service_fn(move |_| {
+            let data = data.clone();
+            async move {
+                Ok::<_, hyper::Error>(service_fn(move |req: Request<Body>| {
+                    let data = data.clone();
+                    async move {
+                        match (req.method().clone(), req.uri().path()) {
+                            (m, "/file") if m == Method::HEAD => {
+                                let mut builder = Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(H_CONTENT_LENGTH, data.len().to_string());
+                                if support_range {
+                                    builder = builder.header(H_ACCEPT_RANGES, "bytes");
+                                }
+                                Ok::<_, hyper::Error>(builder.body(Body::empty()).unwrap())
+                            }
+                            (m, "/file") if m == Method::GET => {
+                                if support_range {
+                                    if let Some(hv) = req.headers().get(H_RANGE) {
+                                        if let Ok(s) = hv.to_str() {
+                                            // attend "bytes=start-end"
+                                            let s = s.trim();
+                                            if let Some(range) = s.strip_prefix("bytes=") {
+                                                let mut it = range.split('-');
+                                                let start: usize = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                                                let end_opt = it.next().and_then(|v| v.parse::<usize>().ok());
+                                                let end = end_opt.unwrap_or_else(|| data.len().saturating_sub(1));
+                                                let start = start.min(data.len());
+                                                let end = end.min(data.len().saturating_sub(1));
+                                                let slice = if end >= start { &data[start..=end] } else { &data[0..0] };
+                                                let content_range = format!("bytes {}-{}/{}", start, start + slice.len().saturating_sub(1), data.len());
+                                                return Ok::<_, hyper::Error>(Response::builder()
+                                                    .status(StatusCode::PARTIAL_CONTENT)
+                                                    .header(H_CONTENT_LENGTH, slice.len())
+                                                    .header(H_CONTENT_RANGE, content_range)
+                                                    .body(Body::from(slice.to_vec()))
+                                                    .unwrap());
+                                            }
+                                        }
+                                    }
+                                }
+                                // Pas de Range ou pas support -> 200 plein
+                                Ok::<_, hyper::Error>(Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(H_CONTENT_LENGTH, data.len())
+                                    .body(Body::from(data.clone()))
+                                    .unwrap())
+                            }
+                            _ => Ok::<_, hyper::Error>(Response::builder().status(StatusCode::NOT_FOUND).body(Body::empty()).unwrap()),
+                        }
+                    }
+                }))
+            }
+        });
+
+        let server = Server::from_tcp(listener).unwrap().serve(make_svc);
+        tokio::spawn(async move {
+            let _ = server.with_graceful_shutdown(async move { let _ = rx.await; }).await;
+        });
+
+        (format!("http://{}:{}/file", addr.ip(), addr.port()), tx)
+    }
+
+    #[tokio::test]
+    async fn test_start_ranged_download() {
+        // Données de test
+        let data: Vec<u8> = (0u8..=255).cycle().take(16 * 1024).collect(); // 16 KiB motif
+        let (url, shutdown) = start_test_server(data.clone(), true).await;
+
+        let dir = tempdir().unwrap();
+        let output_path = dir.path().join("out_ranged.bin");
+
+        let task = DownloadTask {
+            url,
+            output: output_path.clone(),
+            total_size: 0, // sera détecté via HEAD
+            chunk_size: 4096, // 4 KiB
+            num_chunks: 0,
+        };
+
+        let manager = DownloadManager::new();
+        manager.start(task).await.expect("ranged download should succeed");
+
+        // Vérifier contenu
+        let out = fs::read(&output_path).unwrap();
+        assert_eq!(out.len(), data.len());
+        assert_eq!(out, data);
+
+        // Arrêt du serveur
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn test_start_whole_download_no_range() {
+        let data = b"Hello full body without range".to_vec();
+        let (url, shutdown) = start_test_server(data.clone(), false).await;
+
+        let dir = tempdir().unwrap();
+        let output_path = dir.path().join("out_whole.bin");
+
+        let task = DownloadTask {
+            url,
+            output: output_path.clone(),
+            total_size: 0, // via HEAD
+            chunk_size: 4096,
+            num_chunks: 0,
+        };
+
+        let manager = DownloadManager::new();
+        manager.start(task).await.expect("whole download should succeed");
+
+        let out = fs::read(&output_path).unwrap();
+        assert_eq!(out, data);
+        let _ = shutdown.send(());
     }
 }
