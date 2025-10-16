@@ -1,0 +1,8 @@
+[logging]
+filter = "info,scrapes::downloader=debug"
+
+[cleanup]
+# Supprimer les fichiers temporaires (.part*, .done) après téléchargement réussi
+remove_temp_files = true
+# Supprimer les fichiers temporaires en cas d'erreur (pour éviter l'accumulation)
+remove_on_error = false

@@ -8,6 +8,7 @@
 use std::path::PathBuf;
 
 /// Représente un intervalle (chunk) d'un téléchargement
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Chunk {
     pub index: usize,
@@ -19,6 +20,7 @@ pub struct Chunk {
 
 
 /// Représente une tâche de téléchargement (fichier complet)
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct DownloadTask {
     pub url: String,

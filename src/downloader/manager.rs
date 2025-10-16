@@ -115,6 +115,10 @@ impl DownloadManager {
         let part_paths: Vec<_> = chunks.iter().map(|c| c.path.as_path()).collect();
         tracing::info!(file = %task.output.display(), parts = part_paths.len(), "Fusion des parties en sortie");
         merge_chunks(&part_paths, &task.output).context("Fusionner chunks")?;
+        
+        // Nettoyage des fichiers temporaires
+        self.cleanup_temp_files(&chunks).context("Nettoyer fichiers temporaires")?;
+        
         tracing::info!(file = %task.output.display(), "Téléchargement terminé");
         Ok(())
     }
@@ -160,6 +164,29 @@ impl DownloadManager {
             tracing::debug!(downloaded, "Téléchargement plein en cours");
         }
         file.flush().await?;
+        Ok(())
+    }
+
+    /// Nettoie les fichiers temporaires après fusion réussie
+    fn cleanup_temp_files(&self, chunks: &[Chunk]) -> io::Result<()> {
+        tracing::info!("Nettoyage des fichiers temporaires");
+        
+        for chunk in chunks {
+            // Supprimer le fichier part
+            if chunk.path.exists() {
+                std::fs::remove_file(&chunk.path)?;
+                tracing::debug!(path = %chunk.path.display(), "Fichier part supprimé");
+            }
+            
+            // Supprimer le marqueur .done
+            let marker = done_marker_path(&chunk.path);
+            if marker.exists() {
+                std::fs::remove_file(&marker)?;
+                tracing::debug!(path = %marker.display(), "Marqueur .done supprimé");
+            }
+        }
+        
+        tracing::info!("Nettoyage terminé");
         Ok(())
     }
 }
