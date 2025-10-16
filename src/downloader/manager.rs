@@ -8,14 +8,15 @@
 //! - Chaque fichier de chunk est pré‑alloué à la taille exacte de son segment
 //!   pour éviter des réallocations et garantir des écritures positionnées efficaces.
 use std::{io};
-use crate::downloader::{create_empty_file, merge_chunks, DownloadTask};
-use crate::downloader::Chunk;
-use anyhow::{Context, Result};
-use reqwest::header::{ACCEPT_RANGES, CONTENT_LENGTH, RANGE};
 use reqwest::Client;
-use futures::stream::{self, StreamExt};
-use tokio::io::{AsyncWriteExt};
 use tokio::fs::{OpenOptions};
+use anyhow::{Context, Result};
+use tokio::io::{AsyncWriteExt};
+use std::path::{Path, PathBuf};
+use futures::stream::{self, StreamExt};
+use reqwest::header::{ACCEPT_RANGES, CONTENT_LENGTH, RANGE};
+use super::utils::{create_empty_file, merge_chunks};
+use super::types::{DownloadTask, Chunk};
 
 pub struct DownloadManager;
 
@@ -71,11 +72,21 @@ impl DownloadManager {
         // Préparer les chunks et fichiers
         let chunks = self.prepare(&task).context("Préparer chunks")?;
 
+        // Reprise: ignorer les segments déjà complétés (présence d'un marqueur .done)
+        let to_download: Vec<Chunk> = chunks
+            .iter()
+            .cloned()
+            .filter(|c| {
+                let marker = done_marker_path(&c.path);
+                !marker.exists()
+            })
+            .collect();
+
         // Concurrence bornée
         let max_concurrency = 6usize;
 
         let url = task.url.clone();
-        stream::iter(chunks.clone())
+        stream::iter(to_download.clone())
             .map(|chunk| {
                 let client = client.clone();
                 let url = url.clone();
@@ -162,14 +173,24 @@ async fn download_chunk(client: &Client, url: &str, chunk: &Chunk) -> Result<()>
         file.write_all(&bytes).await?;
     }
     file.flush().await?;
+    // Marquer ce segment comme complété
+    let marker = done_marker_path(part_path);
+    let _ = OpenOptions::new().create(true).write(true).open(marker).await?;
     Ok(())
+}
+
+fn done_marker_path(part_path: &Path) -> PathBuf {
+    let name = part_path.file_name().unwrap_or_else(|| std::ffi::OsStr::new("part"));
+    let mut s = name.to_string_lossy().to_string();
+    s.push_str(".done");
+    part_path.with_file_name(s)
 }
 
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::downloader::{Chunk, DownloadTask};
+    use crate::downloader::types::DownloadTask;
     use tempfile::tempdir;
     use std::fs;
     use std::net::TcpListener as StdTcpListener;

@@ -17,11 +17,23 @@
 //! - Ajout du téléchargement HTTP parallèle (plages `Range`) et reprise.
 //! - Progression par chunk et agrégation vers un indicateur global.
 //! - Vérification d'intégrité (hash) post‑merge.
-pub mod types;
-pub mod utils;
-pub mod manager;
+mod types;
+mod utils;
+mod manager;
+use manager::DownloadManager;
+use types::DownloadTask;
+use std::path::PathBuf;
 
-
-pub use types::*;
-pub use utils::*;
-pub use manager::*;
+/// API publique minimale: télécharge une ressource `url` vers `output`.
+/// Cache l'ensemble des détails d'orchestration.
+pub async fn download_to(url: String, output: PathBuf) -> anyhow::Result<()> {
+    let task = DownloadTask {
+        url,
+        output,
+        total_size: 0,
+        chunk_size: 4 * 1024 * 1024, // 4 MiB par défaut
+        num_chunks: 0,
+    };
+    let manager = DownloadManager::new();
+    manager.start(task).await
+}
