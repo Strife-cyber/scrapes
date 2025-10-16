@@ -11,6 +11,7 @@ use std::io::{self, BufReader, BufWriter, Write, Read};
 /// Crée ou tronque un fichier à la taille spécifiée.
 /// Utilisé pour pré‑allouer les fichiers de parties.
 pub fn create_empty_file(path: &Path, size: u64) -> io::Result<File> {
+    tracing::debug!(?path, size, "Préallocation du fichier de partie");
     let file = File::create(path)?;
     file.set_len(size)?; // alloue l'espace sur disque
     Ok(file)
@@ -18,12 +19,14 @@ pub fn create_empty_file(path: &Path, size: u64) -> io::Result<File> {
 
 
 pub fn merge_chunks(parts: &[&Path], output: &Path) -> io::Result<()> {
+    tracing::info!(count = parts.len(), ?output, "Fusion des parties -> fichier final");
     let out_file = File::create(output)?;
     // Tampon de sortie plus grand pour réduire les appels système
     let mut writer = BufWriter::with_capacity(1 << 20, out_file); // 1 MiB
 
     let mut buffer = vec![0u8; 1 << 20]; // 1 MiB buffer pour la lecture
     for part in parts {
+        tracing::debug!(?part, "Concaténation d'une partie");
         let file = File::open(part)?;
         let mut reader = BufReader::with_capacity(1 << 20, file);
         loop {
@@ -34,6 +37,7 @@ pub fn merge_chunks(parts: &[&Path], output: &Path) -> io::Result<()> {
     }
 
     writer.flush()?;
+    tracing::info!(?output, "Fusion terminée");
     Ok(())
 }
 

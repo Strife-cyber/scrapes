@@ -33,11 +33,13 @@ impl DownloadManager {
     /// - Pour chaque segment, crée un fichier temporaire `output.part<index>` si absent,
     ///   avec une taille pré‑allouée correspondant exactement à `[start..=end]`.
     pub fn prepare(&self, task: &DownloadTask) -> io::Result<Vec<Chunk>> {
+        tracing::info!(url = %task.url, total_size = task.total_size, chunk_size = task.chunk_size, "Préparation des segments");
         let chunks = task.create_chunks();
 
         for chunk in &chunks {
             // Créer le fichier part si absent, pré‑alloué à la taille réelle du chunk
             if !chunk.path.exists() {
+                tracing::debug!(index = chunk.index, start = chunk.start, end = chunk.end, path = %chunk.path.display(), "Création du fichier de partie");
                 let part_len = (chunk.end - chunk.start) + 1;
                 create_empty_file(&chunk.path, part_len)?;
             }
@@ -54,6 +56,7 @@ impl DownloadManager {
     /// - Télécharge les segments en parallèle avec une limite de concurrence.
     /// - Fusionne les parties en un fichier final à la fin.
     pub async fn start(&self, mut task: DownloadTask) -> Result<()> {
+        tracing::info!(url = %task.url, "Démarrage du téléchargement");
         let client = Client::builder().build().context("Créer client HTTP")?;
 
         // Déterminer la taille et le support des ranges si absent
@@ -62,9 +65,11 @@ impl DownloadManager {
             .await
             .context("Détecter métadonnées distantes")?;
         task.total_size = total_size;
+        tracing::info!(total_size, supports_range, "Métadonnées distantes récupérées");
 
         // Si le serveur ne supporte pas les ranges, télécharger en 1 requête
         if !supports_range {
+            tracing::warn!("Serveur sans support Range: téléchargement en une requête");
             self.download_whole(&client, &task).await?;
             return Ok(());
         }
@@ -81,9 +86,11 @@ impl DownloadManager {
                 !marker.exists()
             })
             .collect();
+        tracing::info!(pending = to_download.len(), total = chunks.len(), "Segments à télécharger");
 
         // Concurrence bornée
-        let max_concurrency = 6usize;
+        let max_concurrency = 8usize;
+        tracing::info!(max_concurrency, "Téléchargements parallèles");
 
         let url = task.url.clone();
         stream::iter(to_download.clone())
@@ -106,7 +113,9 @@ impl DownloadManager {
 
         // Fusion des fichiers partiels
         let part_paths: Vec<_> = chunks.iter().map(|c| c.path.as_path()).collect();
+        tracing::info!(file = %task.output.display(), parts = part_paths.len(), "Fusion des parties en sortie");
         merge_chunks(&part_paths, &task.output).context("Fusionner chunks")?;
+        tracing::info!(file = %task.output.display(), "Téléchargement terminé");
         Ok(())
     }
 
@@ -144,8 +153,11 @@ impl DownloadManager {
 
         // Écrire directement dans le fichier final
         let mut file = OpenOptions::new().create(true).truncate(true).write(true).open(&task.output).await?;
+        let mut downloaded: u64 = 0;
         while let Some(chunk) = resp.chunk().await.context("Lire chunk HTTP")? {
+            downloaded += chunk.len() as u64;
             file.write_all(&chunk).await?;
+            tracing::debug!(downloaded, "Téléchargement plein en cours");
         }
         file.flush().await?;
         Ok(())
@@ -154,6 +166,7 @@ impl DownloadManager {
 
 /// Télécharge un segment unique via HTTP `Range` et l'écrit dans le fichier part.
 async fn download_chunk(client: &Client, url: &str, chunk: &Chunk) -> Result<()> {
+    tracing::info!(index = chunk.index, start = chunk.start, end = chunk.end, "Téléchargement du segment");
     let range_header = format!("bytes={}-{}", chunk.start, chunk.end);
     let resp = client
         .get(url)
@@ -169,13 +182,17 @@ async fn download_chunk(client: &Client, url: &str, chunk: &Chunk) -> Result<()>
     let part_path = &chunk.path;
     let mut file = OpenOptions::new().write(true).truncate(true).open(part_path).await?;
 
+    let mut downloaded: u64 = 0;
     while let Some(bytes) = resp.chunk().await.context("Lire chunk HTTP")? {
+        downloaded += bytes.len() as u64;
         file.write_all(&bytes).await?;
+        tracing::debug!(index = chunk.index, downloaded, "Flux reçu pour le segment");
     }
     file.flush().await?;
     // Marquer ce segment comme complété
     let marker = done_marker_path(part_path);
     let _ = OpenOptions::new().create(true).write(true).open(marker).await?;
+    tracing::info!(index = chunk.index, "Segment complété");
     Ok(())
 }
 

@@ -23,15 +23,26 @@ mod manager;
 use manager::DownloadManager;
 use types::DownloadTask;
 use std::path::PathBuf;
+const DEFAULT_CHUNK_SIZE: u64 = 8 * 1024 * 1024; // 8 MiB
 
 /// API publique minimale: télécharge une ressource `url` vers `output`.
 /// Cache l'ensemble des détails d'orchestration.
 pub async fn download_to(url: String, output: PathBuf) -> anyhow::Result<()> {
+    download_to_with_chunk_size(url, output, None).await
+}
+
+/// Variante avec paramètre optionnel pour la taille des chunks.
+/// Si `chunk_size` est `None`, une valeur par défaut performante est utilisée.
+pub async fn download_to_with_chunk_size(
+    url: String,
+    output: PathBuf,
+    chunk_size: Option<u64>,
+) -> anyhow::Result<()> {
     let task = DownloadTask {
         url,
         output,
         total_size: 0,
-        chunk_size: 4 * 1024 * 1024, // 4 MiB par défaut
+        chunk_size: chunk_size.unwrap_or(DEFAULT_CHUNK_SIZE),
         num_chunks: 0,
     };
     let manager = DownloadManager::new();
