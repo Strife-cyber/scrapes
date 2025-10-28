@@ -4,6 +4,9 @@ use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 use url::Url;
+use tokio::sync::Semaphore;
+use std::sync::Arc;
+use futures::stream::{self, StreamExt};
 
 /// Structure représentant une saison avec ses épisodes
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,6 +37,8 @@ pub struct DownloadLink {
 pub struct FztvScraper {
     client: Client,
     base_url: String,
+    // Semaphore pour limiter les requêtes concurrentes
+    semaphore: Arc<Semaphore>,
 }
 
 impl FztvScraper {
@@ -45,7 +50,10 @@ impl FztvScraper {
             .build()
             .expect("Impossible de créer le client HTTP");
 
-        Self { client, base_url }
+        // Limite à 10 requêtes concurrentes pour ne pas surcharger le serveur
+        let semaphore = Arc::new(Semaphore::new(10));
+
+        Self { client, base_url, semaphore }
     }
 
     /// Scrape toutes les saisons disponibles sur la page principale
@@ -59,7 +67,8 @@ impl FztvScraper {
         let season_selector = Selector::parse("a[itemprop=\"url\"]")
             .map_err(|e| anyhow::anyhow!("Impossible de créer le sélecteur pour les saisons: {}", e))?;
         
-        let mut seasons = Vec::new();
+        // Collecter toutes les infos de saisons d'abord
+        let mut season_infos = Vec::new();
         
         for element in document.select(&season_selector) {
             if let Some(href) = element.value().attr("href") {
@@ -77,17 +86,24 @@ impl FztvScraper {
                 let season_url = self.resolve_url(href)?;
                 
                 info!("Saison trouvée: {} -> {}", season_name, season_url);
-                
-                // Scraper les épisodes de cette saison
-                let episodes = self.scrape_episodes(&season_url).await?;
-                
-                seasons.push(Season {
-                    name: season_name,
-                    url: season_url,
-                    episodes,
-                });
+                season_infos.push((season_name, season_url));
             }
         }
+        
+        // Scraper toutes les saisons en parallèle avec contrôle de concurrence
+        let seasons = stream::iter(season_infos)
+            .map(|(name, url)| async move {
+                let episodes = self.scrape_episodes(&url).await.ok()?;
+                Some(Season {
+                    name,
+                    url,
+                    episodes,
+                })
+            })
+            .buffer_unordered(10)  // Traiter jusqu'à 10 saisons en parallèle
+            .filter_map(|x| async { x })
+            .collect::<Vec<_>>()
+            .await;
         
         info!("{} saisons FZTV trouvées", seasons.len());
         Ok(seasons)
@@ -100,35 +116,116 @@ impl FztvScraper {
         let html = self.fetch_page(season_url).await?;
         let document = Html::parse_document(&html);
         
-        // Sélecteur pour les blocs d'épisodes (ul avec class contenant "list")
-        let episode_block_selector = Selector::parse("ul.list")
-            .map_err(|e| anyhow::anyhow!("Impossible de créer le sélecteur pour les blocs d'épisodes: {}", e))?;
+        // Debug: Afficher une partie du HTML pour comprendre la structure
+        self.debug_html_structure(&document, season_url).await?;
         
+        // Essayer différents sélecteurs pour trouver les épisodes
         let mut episodes = Vec::new();
         
-        // Pour chaque bloc ul.list, extraire les informations
-        for (episode_index, ul_element) in document.select(&episode_block_selector).enumerate() {
+        // Sélecteur 1: ul.list (original)
+        if let Ok(selector) = Selector::parse("ul.list") {
+            episodes.extend(self.scrape_episodes_with_selector(&document, &selector, "ul.list").await?);
+        }
+        
+        // Sélecteur 2: div avec class contenant "episode" ou "list"
+        if episodes.is_empty() {
+            if let Ok(selector) = Selector::parse("div[class*=\"episode\"], div[class*=\"list\"]") {
+                episodes.extend(self.scrape_episodes_with_selector(&document, &selector, "div.episode/list").await?);
+            }
+        }
+        
+        // Sélecteur 3: table ou tr pour les épisodes
+        if episodes.is_empty() {
+            if let Ok(selector) = Selector::parse("table tr, tr") {
+                episodes.extend(self.scrape_episodes_with_selector(&document, &selector, "table tr").await?);
+            }
+        }
+        
+        // Sélecteur 4: liens avec onclick contenant "episode"
+        if episodes.is_empty() {
+            if let Ok(selector) = Selector::parse("a[onclick*=\"episode\"]") {
+                episodes.extend(self.scrape_episodes_with_selector(&document, &selector, "a[onclick*=\"episode\"]").await?);
+            }
+        }
+        
+        info!("{} épisodes FZTV trouvés pour cette saison", episodes.len());
+        Ok(episodes)
+    }
+    
+    /// Debug function pour examiner la structure HTML
+    async fn debug_html_structure(&self, document: &Html, season_url: &str) -> Result<()> {
+        info!("=== DEBUG HTML STRUCTURE pour {} ===", season_url);
+        
+        // Chercher tous les éléments qui pourraient contenir des épisodes
+        let debug_selectors = vec![
+            "ul", "div", "table", "tr", "li",
+            "a[onclick]", "a[href*=\"episode\"]", "a[href*=\"download\"]",
+            "[class*=\"episode\"]", "[class*=\"list\"]", "[class*=\"download\"]"
+        ];
+        
+        for selector_str in debug_selectors {
+            if let Ok(selector) = Selector::parse(selector_str) {
+                let count = document.select(&selector).count();
+                if count > 0 {
+                    info!("Sélecteur '{}': {} éléments trouvés", selector_str, count);
+                    
+                    // Afficher les premiers éléments pour comprendre la structure
+                    for (i, element) in document.select(&selector).enumerate() {
+                        if i >= 3 { break; } // Limiter à 3 exemples
+                        let text = element.text().collect::<String>().trim().to_string();
+                        let text_preview = if text.len() > 100 { 
+                            format!("{}...", &text[..100]) 
+                        } else { 
+                            text 
+                        };
+                        info!("  Exemple {}: {}", i + 1, text_preview);
+                        
+                        // Afficher les attributs importants
+                        if let Some(onclick) = element.value().attr("onclick") {
+                            info!("    onclick: {}", onclick);
+                        }
+                        if let Some(href) = element.value().attr("href") {
+                            info!("    href: {}", href);
+                        }
+                        if let Some(class) = element.value().attr("class") {
+                            info!("    class: {}", class);
+                        }
+                    }
+                }
+            }
+        }
+        
+        info!("=== FIN DEBUG HTML STRUCTURE ===");
+        Ok(())
+    }
+    
+    /// Scrape les épisodes avec un sélecteur spécifique
+    async fn scrape_episodes_with_selector(&self, document: &Html, selector: &Selector, selector_name: &str) -> Result<Vec<Episode>> {
+        let mut episodes = Vec::new();
+        
+        info!("Tentative de scraping avec le sélecteur: {}", selector_name);
+        
+        for (episode_index, element) in document.select(selector).enumerate() {
             let mut download_links = Vec::new();
             
-            // Extraire le nom de l'épisode depuis le <b> tag avant le ul ou depuis le contenu
-            let episode_name = self.extract_episode_name_from_block(&ul_element, &document)
-                .unwrap_or_else(|| format!("Épisode {}", episode_index + 1));
+            // Essayer d'extraire le nom de l'épisode
+            let episode_name = self.extract_episode_name_from_element(&element, episode_index);
             
-            // Sélecteur pour les liens avec onclick dans ce bloc
-            let link_selector = Selector::parse("a[onclick*=\"window.open\"]")
+            // Chercher les liens de téléchargement dans cet élément
+            let link_selector = Selector::parse("a[onclick*=\"window.open\"], a[onclick*=\"episode\"], a[href*=\"download\"]")
                 .map_err(|e| anyhow::anyhow!("Impossible de créer le sélecteur pour les liens: {}", e))?;
             
-            for element in ul_element.select(&link_selector) {
-                if let Some(onclick) = element.value().attr("onclick") {
+            for link_element in element.select(&link_selector) {
+                if let Some(onclick) = link_element.value().attr("onclick") {
                     // Extraire l'URL de téléchargement, le fileid et le dkey
                     if let Some((download_url, file_id, dkey)) = self.parse_onclick(onclick) {
-                        let quality_selector = Selector::parse("small")
+                        let quality_selector = Selector::parse("small, span, b")
                             .map_err(|e| anyhow::anyhow!("Impossible de créer le sélecteur pour la qualité: {}", e))?;
                         
-                        let quality = element
+                        let quality = link_element
                             .select(&quality_selector)
                             .next()
-                            .and_then(|small| small.text().next())
+                            .and_then(|elem| elem.text().next())
                             .unwrap_or("Qualité inconnue")
                             .to_string();
                         
@@ -143,6 +240,21 @@ impl FztvScraper {
                         download_links.push(download_link);
                     }
                 }
+                
+                // Essayer aussi avec href direct
+                if let Some(href) = link_element.value().attr("href") {
+                    if href.contains("episode") || href.contains("download") {
+                        let quality = "Direct Link".to_string();
+                        let download_link = DownloadLink {
+                            quality,
+                            url: href.to_string(),
+                            file_id: None,
+                            dkey: None,
+                            actual_download_urls: Vec::new(),
+                        };
+                        download_links.push(download_link);
+                    }
+                }
             }
             
             if !download_links.is_empty() {
@@ -153,8 +265,38 @@ impl FztvScraper {
             }
         }
         
-        info!("{} épisodes FZTV trouvés pour cette saison", episodes.len());
+        info!("Sélecteur '{}': {} épisodes trouvés", selector_name, episodes.len());
         Ok(episodes)
+    }
+    
+    /// Extrait le nom de l'épisode depuis un élément
+    fn extract_episode_name_from_element(&self, element: &scraper::ElementRef, episode_index: usize) -> String {
+        // Essayer de trouver du texte dans l'élément ou ses enfants
+        let text = element.text().collect::<String>().trim().to_string();
+        
+        if !text.is_empty() && text.len() > 3 {
+            // Prendre les premiers mots comme nom d'épisode
+            let words: Vec<&str> = text.split_whitespace().take(5).collect();
+            if !words.is_empty() {
+                return words.join(" ");
+            }
+        }
+        
+        // Fallback: chercher dans les éléments enfants
+        let name_selectors = vec!["b", "strong", "span", "div", "a"];
+        for selector_str in name_selectors {
+            if let Ok(selector) = Selector::parse(selector_str) {
+                if let Some(name_elem) = element.select(&selector).next() {
+                    let name_text = name_elem.text().collect::<String>().trim().to_string();
+                    if !name_text.is_empty() && name_text.len() > 3 {
+                        return name_text;
+                    }
+                }
+            }
+        }
+        
+        // Dernier recours: nom générique
+        format!("Épisode {}", episode_index + 1)
     }
 
     /// Parse le contenu onclick pour extraire l'URL de window.location.href, le fileid et le dkey
@@ -269,17 +411,16 @@ impl FztvScraper {
         self.scrape_download_page(&document).await
     }
 
-    /// Extrait le nom de l'épisode depuis un bloc ul.list
-    fn extract_episode_name_from_block(&self, _ul_element: &scraper::ElementRef, _document: &Html) -> Option<String> {
-        // Essayer de trouver un élément <b> qui précède le ul ou qui est dans le parent
-        // Pour l'instant, on retourne None et utilisera le numéro d'épisode par défaut
-        // Cette fonction peut être améliorée selon la structure HTML spécifique
-        None
-    }
 
     /// Récupère le contenu HTML d'une page
     async fn fetch_page(&self, url: &str) -> Result<String> {
         info!("Récupération de la page FZTV: {}", url);
+        
+        // Acquérir le semaphore pour limiter les requêtes concurrentes
+        let _permit = self.semaphore
+            .acquire()
+            .await
+            .map_err(|e| anyhow::anyhow!("Erreur d'acquisition du semaphore: {}", e))?;
         
         let response = self.client
             .get(url)
@@ -386,15 +527,14 @@ impl FztvScraper {
 
     /// Enrichit les saisons existantes avec les liens de téléchargement réels
     /// Ne traite que le premier lien "High MP4" ou le premier lien disponible
-    pub async fn enrich_with_actual_links(&self, mut seasons: Vec<Season>) -> Result<Vec<Season>> {
+    pub async fn enrich_with_actual_links(&self, seasons: Vec<Season>) -> Result<Vec<Season>> {
         info!("Début de l'enrichissement des liens de téléchargement");
         
-        for season in &mut seasons {
-            info!("Traitement de la saison: {}", season.name);
-            
-            for episode in &mut season.episodes {
-                info!("Traitement de l'épisode: {}", episode.name);
-                
+        // Créer une liste de toutes les tâches à traiter (season_idx, episode_idx, url, quality)
+        let mut tasks = Vec::new();
+        
+        for (season_idx, season) in seasons.iter().enumerate() {
+            for (episode_idx, episode) in season.episodes.iter().enumerate() {
                 // Trouver l'index du premier lien "High MP4" ou prendre le premier
                 let target_index = episode.download_links.iter()
                     .position(|link| link.quality.contains("High MP4"))
@@ -406,35 +546,60 @@ impl FztvScraper {
                         }
                     });
                 
-                if let Some(index) = target_index {
-                    let link = &mut episode.download_links[index];
-                    info!("Scraping du lien: {} ({})", link.url, link.quality);
-                    
-                    let url_to_scrape = link.url.clone();
-                    
-                    match self.scrape_actual_download_link(&url_to_scrape).await {
-                        Ok(Some(download_url)) => {
-                            info!("Lien trouvé: {}", download_url);
-                            link.actual_download_urls.push(download_url);
-                        }
-                        Ok(None) => {
-                            info!("Aucun lien trouvé pour cet épisode");
-                        }
-                        Err(e) => {
-                            info!("Erreur lors du scraping: {}", e);
-                        }
+                if let Some(link_idx) = target_index {
+                    let link = &episode.download_links[link_idx];
+                    tasks.push((
+                        season_idx,
+                        episode_idx,
+                        link_idx,
+                        link.url.clone(),
+                        episode.name.clone(),
+                    ));
+                }
+            }
+        }
+        
+        info!("Traitement de {} liens en parallèle", tasks.len());
+        
+        // Traiter toutes les tâches en parallèle avec limitation de concurrence
+        let results: Vec<_> = stream::iter(tasks)
+            .map(|(season_idx, episode_idx, link_idx, url, episode_name)| async move {
+                info!("Scraping du lien pour l'épisode: {}", episode_name);
+                
+                match self.scrape_actual_download_link(&url).await {
+                    Ok(Some(download_url)) => {
+                        info!("Lien trouvé pour {}: {}", episode_name, download_url);
+                        Some((season_idx, episode_idx, link_idx, download_url))
                     }
-                    
-                    // Attendre un peu pour ne pas surcharger le serveur
-                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                } else {
-                    info!("Aucun lien disponible pour cet épisode");
+                    Ok(None) => {
+                        info!("Aucun lien trouvé pour {}", episode_name);
+                        None
+                    }
+                    Err(e) => {
+                        info!("Erreur lors du scraping de {}: {}", episode_name, e);
+                        None
+                    }
+                }
+            })
+            .buffer_unordered(20)  // Traiter jusqu'à 20 liens en parallèle (le semaphore dans fetch_page limite à 10 requêtes réelles)
+            .filter_map(|x| async { x })
+            .collect()
+            .await;
+        
+        // Appliquer les résultats aux saisons
+        let mut enriched_seasons = seasons;
+        for (season_idx, episode_idx, link_idx, download_url) in results {
+            if let Some(season) = enriched_seasons.get_mut(season_idx) {
+                if let Some(episode) = season.episodes.get_mut(episode_idx) {
+                    if let Some(link) = episode.download_links.get_mut(link_idx) {
+                        link.actual_download_urls.push(download_url);
+                    }
                 }
             }
         }
         
         info!("Enrichissement terminé");
-        Ok(seasons)
+        Ok(enriched_seasons)
     }
 }
 
