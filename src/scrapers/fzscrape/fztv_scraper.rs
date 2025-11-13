@@ -2,11 +2,12 @@ use anyhow::{Context, Result};
 use reqwest::Client;
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tracing::{info, warn};
 use url::Url;
 use tokio::sync::Semaphore;
 use std::sync::Arc;
 use futures::stream::{self, StreamExt};
+use webbrowser;
 
 /// Structure représentant une saison avec ses épisodes
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,9 +57,20 @@ impl FztvScraper {
         Self { client, base_url, semaphore }
     }
 
+    /// Ouvre une URL dans le navigateur par défaut pour debug (ACTIVÉ pour le test)
+    fn open_in_browser(&self, url: &str, description: &str) {
+        info!("🌐 Ouverture dans le navigateur: {} - {}", description, url);
+        if let Err(e) = webbrowser::open(url) {
+            warn!("Impossible d'ouvrir le navigateur pour {}: {}", url, e);
+        }
+    }
+
     /// Scrape toutes les saisons disponibles sur la page principale
     pub async fn scrape_seasons(&self, main_url: &str) -> Result<Vec<Season>> {
         info!("Début du scraping des saisons FZTV depuis: {}", main_url);
+        
+        // Ouvrir la page principale dans le navigateur pour debug
+        self.open_in_browser(main_url, "Page Principale FZTV");
         
         let html = self.fetch_page(main_url).await?;
         let document = Html::parse_document(&html);
@@ -110,8 +122,12 @@ impl FztvScraper {
     }
 
     /// Scrape tous les épisodes d'une saison donnée
-    async fn scrape_episodes(&self, season_url: &str) -> Result<Vec<Episode>> {
+    /// Scrape les épisodes d'une saison spécifique
+    pub async fn scrape_episodes(&self, season_url: &str) -> Result<Vec<Episode>> {
         info!("Scraping des épisodes FZTV pour: {}", season_url);
+        
+        // Ouvrir la page de saison dans le navigateur pour debug
+        self.open_in_browser(season_url, "Page Saison");
         
         let html = self.fetch_page(season_url).await?;
         let document = Html::parse_document(&html);
@@ -333,11 +349,70 @@ impl FztvScraper {
         None
     }
 
+    /// Scrape les URLs de téléchargement réelles avec traitement rapide pour éviter l'expiration
+    async fn scrape_download_urls_fast(&self, download_page_url: &str) -> Result<Vec<String>> {
+        info!("🚀 Scraping rapide des URLs de téléchargement depuis: {}", download_page_url);
+        
+        // Construire l'URL complète si nécessaire
+        let full_url = if download_page_url.starts_with("http") {
+            download_page_url.to_string()
+        } else {
+            self.resolve_url(download_page_url)?
+        };
+        
+        info!("URL complète pour le scraping rapide: {}", full_url);
+        
+        // Ouvrir la page de téléchargement dans le navigateur pour debug
+        self.open_in_browser(&full_url, "Page de Téléchargement");
+        
+        let html = match self.fetch_page(&full_url).await {
+            Ok(html) => html,
+            Err(e) => {
+                warn!("Erreur lors de la récupération de la page {}: {}", full_url, e);
+                return Ok(Vec::new()); // Retourner une liste vide au lieu d'échouer
+            }
+        };
+        
+        let document = Html::parse_document(&html);
+        
+        // Si c'est une page episode.php, chercher le lien "DOWNLOAD THIS EPISODE ON YOUR DEVICE"
+        if download_page_url.contains("episode.php") {
+            return self.scrape_episode_page(&document).await;
+        }
+        
+        // Si c'est une page downloadmp4.php, chercher directement les liens
+        if download_page_url.contains("downloadmp4.php") {
+            return self.scrape_download_page_fast(&document).await;
+        }
+        
+        // Sinon, essayer de scraper directement
+        self.scrape_download_page_fast(&document).await
+    }
+
     /// Scrape les URLs de téléchargement réelles depuis la page de téléchargement
     async fn scrape_download_urls(&self, download_page_url: &str) -> Result<Vec<String>> {
         info!("Scraping des URLs de téléchargement FZTV depuis: {}", download_page_url);
         
-        let html = self.fetch_page(download_page_url).await?;
+        // Construire l'URL complète si nécessaire
+        let full_url = if download_page_url.starts_with("http") {
+            download_page_url.to_string()
+        } else {
+            self.resolve_url(download_page_url)?
+        };
+        
+        info!("URL complète pour le scraping: {}", full_url);
+        
+        // Ouvrir la page de téléchargement dans le navigateur pour debug
+        self.open_in_browser(&full_url, "Page Download Final");
+        
+        let html = match self.fetch_page(&full_url).await {
+            Ok(html) => html,
+            Err(e) => {
+                info!("Erreur lors de la récupération de la page {}: {}", full_url, e);
+                return Ok(Vec::new()); // Retourner une liste vide au lieu d'échouer
+            }
+        };
+        
         let document = Html::parse_document(&html);
         
         // Si c'est une page episode.php, chercher le lien "DOWNLOAD THIS EPISODE ON YOUR DEVICE"
@@ -379,15 +454,231 @@ impl FztvScraper {
         Ok(Vec::new())
     }
 
-    /// Scrape une page download.php pour extraire les URLs de téléchargement
-    async fn scrape_download_page(&self, document: &Html) -> Result<Vec<String>> {
-        // Sélecteur pour les divs contenant les liens de téléchargement
-        let download_links_selector = Selector::parse("div.downloadlinks2")
-            .map_err(|e| anyhow::anyhow!("Impossible de créer le sélecteur pour les liens de téléchargement: {}", e))?;
+    /// Scrape une page download.php pour extraire les URLs de téléchargement (version rapide)
+    async fn scrape_download_page_fast(&self, document: &Html) -> Result<Vec<String>> {
+        info!("🚀 Recherche rapide des URLs de téléchargement réelles dans la page");
         
         let mut download_urls = Vec::new();
         
+        // Méthode 1: Chercher les textbox avec les URLs directes (PRIORITÉ ABSOLUE - basé sur l'observation du navigateur)
+        let textbox_selector = Selector::parse("textbox")
+            .map_err(|e| anyhow::anyhow!("Impossible de créer le sélecteur pour les textbox: {}", e))?;
+        
+        for textbox in document.select(&textbox_selector) {
+            if let Some(value) = textbox.value().attr("value") {
+                if value.starts_with("http") && !value.contains("t.me") && !value.contains("instagram") && !value.contains("fzmovies.live") {
+                    download_urls.push(value.to_string());
+                    info!("🎯 URL de téléchargement réelle trouvée (textbox): {}", value);
+                }
+            }
+        }
+        
+        // Méthode 2: Chercher dans div.downloadlinks2 avec input[name="filelink"] (fallback)
+        if download_urls.is_empty() {
+            let download_links_selector = Selector::parse("div.downloadlinks2")
+                .map_err(|e| anyhow::anyhow!("Impossible de créer le sélecteur pour les liens de téléchargement: {}", e))?;
+            
+            for element in document.select(&download_links_selector) {
+            info!("✅ Div downloadlinks2 trouvé, recherche des inputs filelink");
+            
+            // Chercher les inputs avec name="filelink"
+            let input_selector = Selector::parse("input[name=\"filelink\"]")
+                .map_err(|e| anyhow::anyhow!("Impossible de créer le sélecteur pour les inputs: {}", e))?;
+            
+            for input in element.select(&input_selector) {
+                if let Some(value) = input.value().attr("value") {
+                    // Vérifier que c'est une URL de téléchargement valide (pas de liens sociaux)
+                    if value.starts_with("http") && !value.contains("t.me") && !value.contains("instagram") && !value.contains("fzmovies.live") {
+                        download_urls.push(value.to_string());
+                        info!("🎯 URL de téléchargement réelle trouvée dans downloadlinks2: {}", value);
+                    } else {
+                        info!("⚠️ URL ignorée (lien social ou invalide): {}", value);
+                    }
+                }
+            }
+            }
+        }
+        
+        // Méthode 3: Si pas trouvé, chercher directement tous les inputs filelink
+        if download_urls.is_empty() {
+            info!("⚠️ Aucun div.downloadlinks2 trouvé, recherche directe des inputs filelink");
+            let input_selector = Selector::parse("input[name=\"filelink\"]")
+                .map_err(|e| anyhow::anyhow!("Impossible de créer le sélecteur pour les inputs: {}", e))?;
+            
+            for input in document.select(&input_selector) {
+                if let Some(value) = input.value().attr("value") {
+                    // Vérifier que c'est une URL de téléchargement valide
+                    if value.starts_with("http") && !value.contains("t.me") && !value.contains("instagram") && !value.contains("fzmovies.live") {
+                        download_urls.push(value.to_string());
+                        info!("🎯 URL de téléchargement réelle trouvée (directe): {}", value);
+                    } else {
+                        info!("⚠️ URL ignorée (lien social ou invalide): {}", value);
+                    }
+                }
+            }
+        }
+        
+        // Méthode 4: Chercher les liens flink1, flink2, etc.
+        if download_urls.is_empty() {
+            info!("⚠️ Aucun input filelink trouvé, recherche des liens flink");
+            let flink_selector = Selector::parse("a[id^=\"flink\"]")
+                .map_err(|e| anyhow::anyhow!("Impossible de créer le sélecteur pour flink: {}", e))?;
+            
+            for link in document.select(&flink_selector) {
+                if let Some(href) = link.value().attr("href") {
+                    if href.starts_with("http") {
+                        download_urls.push(href.to_string());
+                        info!("🎯 Lien flink trouvé: {}", href);
+                    }
+                }
+            }
+        }
+        
+        // Méthode 5: Recherche de tous les éléments contenant des URLs (fallback)
+        if download_urls.is_empty() {
+            info!("⚠️ Aucun lien spécifique trouvé, recherche générale des URLs");
+            download_urls = self.find_all_urls_in_page(document).await?;
+        }
+        
+        info!("🚀 {} URLs de téléchargement réelles trouvées (rapide)", download_urls.len());
+        Ok(download_urls)
+    }
+
+    /// Trouve toutes les URLs dans une page (méthode de fallback)
+    async fn find_all_urls_in_page(&self, document: &Html) -> Result<Vec<String>> {
+        info!("🔍 Recherche générale de toutes les URLs dans la page");
+        
+        let mut urls = Vec::new();
+        
+        // Chercher tous les inputs avec des URLs
+        let input_selector = Selector::parse("input[type=\"text\"]")
+            .map_err(|e| anyhow::anyhow!("Impossible de créer le sélecteur pour les inputs: {}", e))?;
+        
+        for input in document.select(&input_selector) {
+            if let Some(value) = input.value().attr("value") {
+                if value.starts_with("http") && !value.contains("t.me") && !value.contains("instagram") && !value.contains("fzmovies.live") {
+                    urls.push(value.to_string());
+                    info!("🔗 URL trouvée dans input: {}", value);
+                }
+            }
+        }
+        
+        // Chercher tous les liens avec des URLs
+        let link_selector = Selector::parse("a[href*=\"http\"]")
+            .map_err(|e| anyhow::anyhow!("Impossible de créer le sélecteur pour les liens: {}", e))?;
+        
+        for link in document.select(&link_selector) {
+            if let Some(href) = link.value().attr("href") {
+                if href.starts_with("http") && !href.contains("t.me") && !href.contains("instagram") && !href.contains("fzmovies.live") {
+                    urls.push(href.to_string());
+                    info!("🔗 URL trouvée dans lien: {}", href);
+                }
+            }
+        }
+        
+        info!("🔍 {} URLs trouvées dans la page", urls.len());
+        Ok(urls)
+    }
+
+    /// Test spécifique pour une URL donnée avec debug HTML complet et délai de chargement
+    pub async fn test_specific_url(&self, url: &str) -> Result<Vec<String>> {
+        info!("🧪 Test spécifique pour l'URL: {}", url);
+        
+        let html = self.fetch_page(url).await?;
+        
+        // Attendre un peu pour s'assurer que la page est complètement chargée
+        info!("🧪 Attente de 2 secondes pour le chargement complet de la page...");
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        
+        let document = Html::parse_document(&html);
+        
+        // Debug HTML complet pour comprendre la structure
+        info!("🧪 === DEBUG HTML COMPLET ===");
+        info!("🧪 Taille du HTML: {} caractères", html.len());
+        
+        // Chercher tous les divs
+        let div_selector = Selector::parse("div").unwrap();
+        let mut div_count = 0;
+        for div in document.select(&div_selector) {
+            div_count += 1;
+            if div_count <= 10 { // Limiter à 10 pour éviter le spam
+                if let Some(class) = div.value().attr("class") {
+                    info!("🧪 Div {}: class='{}'", div_count, class);
+                } else {
+                    info!("🧪 Div {}: pas de class", div_count);
+                }
+            }
+        }
+        info!("🧪 Total divs trouvés: {}", div_count);
+        
+        // Chercher tous les inputs
+        let input_selector = Selector::parse("input").unwrap();
+        let mut input_count = 0;
+        for input in document.select(&input_selector) {
+            input_count += 1;
+            let name = input.value().attr("name").unwrap_or("pas de name");
+            let value = input.value().attr("value").unwrap_or("pas de value");
+            let input_type = input.value().attr("type").unwrap_or("pas de type");
+            info!("🧪 Input {}: name='{}', type='{}', value='{}'", input_count, name, input_type, value);
+        }
+        info!("🧪 Total inputs trouvés: {}", input_count);
+        
+        // Chercher spécifiquement div.downloadlinks2
+        let downloadlinks_selector = Selector::parse("div.downloadlinks2").unwrap();
+        let mut downloadlinks_count = 0;
+        for div in document.select(&downloadlinks_selector) {
+            downloadlinks_count += 1;
+            info!("🧪 Div downloadlinks2 {} trouvé!", downloadlinks_count);
+            
+            // Chercher les inputs filelink dans ce div
+            let filelink_selector = Selector::parse("input[name=\"filelink\"]").unwrap();
+            for input in div.select(&filelink_selector) {
+                if let Some(value) = input.value().attr("value") {
+                    info!("🧪 Input filelink trouvé: {}", value);
+                }
+            }
+        }
+        info!("🧪 Total div.downloadlinks2 trouvés: {}", downloadlinks_count);
+        
+        // Chercher tous les liens
+        let link_selector = Selector::parse("a").unwrap();
+        let mut link_count = 0;
+        for link in document.select(&link_selector) {
+            link_count += 1;
+            if link_count <= 10 { // Limiter à 10
+                let href = link.value().attr("href").unwrap_or("pas de href");
+                let id = link.value().attr("id").unwrap_or("pas d'id");
+                info!("🧪 Lien {}: href='{}', id='{}'", link_count, href, id);
+            }
+        }
+        info!("🧪 Total liens trouvés: {}", link_count);
+        
+        info!("🧪 === FIN DEBUG HTML COMPLET ===");
+        
+        // Utiliser la méthode rapide pour extraire les URLs
+        let urls = self.scrape_download_page_fast(&document).await?;
+        
+        info!("🧪 Résultat du test: {} URLs trouvées", urls.len());
+        for (i, url) in urls.iter().enumerate() {
+            info!("🧪 URL {}: {}", i + 1, url);
+        }
+        
+        Ok(urls)
+    }
+
+    /// Scrape une page download.php pour extraire les URLs de téléchargement
+    async fn scrape_download_page(&self, document: &Html) -> Result<Vec<String>> {
+        info!("Recherche des URLs de téléchargement réelles dans la page");
+        
+        let mut download_urls = Vec::new();
+        
+        // Méthode 1: Chercher dans div.downloadlinks2 avec input[name="filelink"]
+        let download_links_selector = Selector::parse("div.downloadlinks2")
+            .map_err(|e| anyhow::anyhow!("Impossible de créer le sélecteur pour les liens de téléchargement: {}", e))?;
+        
         for element in document.select(&download_links_selector) {
+            info!("Div downloadlinks2 trouvé, recherche des inputs filelink");
+            
             // Chercher les inputs avec name="filelink"
             let input_selector = Selector::parse("input[name=\"filelink\"]")
                 .map_err(|e| anyhow::anyhow!("Impossible de créer le sélecteur pour les inputs: {}", e))?;
@@ -395,12 +686,101 @@ impl FztvScraper {
             for input in element.select(&input_selector) {
                 if let Some(value) = input.value().attr("value") {
                     download_urls.push(value.to_string());
-                    info!("URL de téléchargement FZTV trouvée: {}", value);
+                    info!("URL de téléchargement réelle trouvée: {}", value);
+                    
+                    // Ouvrir l'URL de téléchargement finale dans le navigateur pour debug
+                    self.open_in_browser(value, "URL de téléchargement finale");
                 }
             }
         }
         
-        info!("{} URLs de téléchargement FZTV trouvées", download_urls.len());
+        // Méthode 2: Si pas trouvé, chercher directement tous les inputs filelink
+        if download_urls.is_empty() {
+            info!("Aucun div.downloadlinks2 trouvé, recherche directe des inputs filelink");
+            let input_selector = Selector::parse("input[name=\"filelink\"]")
+                .map_err(|e| anyhow::anyhow!("Impossible de créer le sélecteur pour les inputs: {}", e))?;
+            
+            for input in document.select(&input_selector) {
+                if let Some(value) = input.value().attr("value") {
+                    download_urls.push(value.to_string());
+                    info!("URL de téléchargement directe trouvée: {}", value);
+                }
+            }
+        }
+        
+        // Méthode 3: Chercher aussi dans les liens avec id="flink1", "flink2", etc.
+        if download_urls.is_empty() {
+            info!("Recherche des liens flink1, flink2, etc.");
+            let flink_selector = Selector::parse("a[id^=\"flink\"]")
+                .map_err(|e| anyhow::anyhow!("Impossible de créer le sélecteur pour les liens flink: {}", e))?;
+            
+            for link in document.select(&flink_selector) {
+                if let Some(href) = link.value().attr("href") {
+                    // Construire l'URL complète
+                    let full_url = self.resolve_url(href)?;
+                    download_urls.push(full_url.clone());
+                    info!("Lien flink trouvé: {}", full_url);
+                }
+            }
+        }
+        
+        // Méthode 4: Debug - afficher tous les éléments qui pourraient contenir des URLs
+        if download_urls.is_empty() {
+            info!("=== DEBUG: Recherche de tous les éléments contenant des URLs ===");
+            
+            let debug_selectors = vec![
+                "div[class*=\"download\"]",
+                "div[class*=\"link\"]", 
+                "input[type=\"text\"]",
+                "a[href*=\"filelink\"]",
+                "a[href*=\"rlink\"]",
+                "a[href*=\"http\"]"
+            ];
+            
+            for selector_str in debug_selectors {
+                if let Ok(selector) = Selector::parse(selector_str) {
+                    let count = document.select(&selector).count();
+                    if count > 0 {
+                        info!("Sélecteur '{}': {} éléments trouvés", selector_str, count);
+                        
+                        for (i, element) in document.select(&selector).enumerate() {
+                            if i >= 2 { break; } // Limiter à 2 exemples
+                            
+                            let text = element.text().collect::<String>().trim().to_string();
+                            let text_preview = if text.len() > 100 { 
+                                format!("{}...", &text[..100]) 
+                            } else { 
+                                text 
+                            };
+                            
+                            info!("  Exemple {}: {}", i + 1, text_preview);
+                            
+                            // Afficher les attributs importants
+                            if let Some(value) = element.value().attr("value") {
+                                info!("    value: {}", value);
+                                if value.contains("http") && !download_urls.contains(&value.to_string()) {
+                                    download_urls.push(value.to_string());
+                                    info!("    -> URL ajoutée: {}", value);
+                                }
+                            }
+                            if let Some(href) = element.value().attr("href") {
+                                info!("    href: {}", href);
+                                if href.contains("http") || href.contains("filelink") || href.contains("rlink") {
+                                    let full_url = self.resolve_url(href).unwrap_or_else(|_| href.to_string());
+                                    if !download_urls.contains(&full_url) {
+                                        download_urls.push(full_url.clone());
+                                        info!("    -> URL ajoutée: {}", full_url);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            info!("=== FIN DEBUG ===");
+        }
+        
+        info!("{} URLs de téléchargement réelles trouvées", download_urls.len());
         Ok(download_urls)
     }
 
@@ -464,15 +844,14 @@ impl FztvScraper {
         Ok(seasons)
     }
 
-    /// Scrape les liens de téléchargement réels depuis une page episode.php
-    /// Cette fonction navigue vers la page episode.php et extrait le lien downloadmp4.php
-    pub async fn scrape_actual_download_link(&self, episode_url: &str) -> Result<Option<String>> {
-        info!("Scraping du lien de téléchargement réel depuis: {}", episode_url);
+    /// Scrape les liens de téléchargement réels avec traitement rapide pour éviter l'expiration
+    pub async fn scrape_actual_download_link_fast(&self, episode_url: &str) -> Result<Option<String>> {
+        info!("🚀 Scraping rapide du lien de téléchargement depuis: {}", episode_url);
         
         // Construire l'URL complète
         let full_url = self.resolve_url(episode_url)?;
         
-        // Récupérer le contenu de la page
+        // Récupérer le contenu de la page episode.php
         let html = self.fetch_page(&full_url).await?;
         let document = Html::parse_document(&html);
         
@@ -491,22 +870,137 @@ impl FztvScraper {
                     info!("Onclick trouvé: {}", onclick);
                     
                     // Extraire l'URL de window.location.href
-                    if let Some(start) = onclick.find("window.location.href=&quot;") {
-                        let start = start + 27; // Longueur de "window.location.href=&quot;"
-                        if let Some(end) = onclick[start..].find("&quot;") {
-                            let download_url = &onclick[start..start + end];
-                            info!("URL de téléchargement trouvée: {}", download_url);
-                            return Ok(Some(download_url.to_string()));
-                        }
-                    }
-                    
-                    // Essayer aussi sans l'encodage HTML
-                    if let Some(start) = onclick.find("window.location.href=\"") {
+                    let download_url = if let Some(start) = onclick.find("window.location.href=&quot;") {
                         let start = start + 22; // Longueur de "window.location.href=\""
                         if let Some(end) = onclick[start..].find("\"") {
-                            let download_url = &onclick[start..start + end];
-                            info!("URL de téléchargement trouvée: {}", download_url);
-                            return Ok(Some(download_url.to_string()));
+                            Some(onclick[start..start + end].to_string())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    
+                    if let Some(url) = download_url {
+                        info!("URL de téléchargement intermédiaire trouvée: {}", url);
+                        
+                        // Construire l'URL complète en combinant avec la base URL
+                        let full_download_url = if url.starts_with("http") {
+                            url
+                        } else {
+                            self.resolve_url(&url)?
+                        };
+                        
+                        info!("URL complète pour le scraping: {}", full_download_url);
+                        
+                        // Traitement IMMÉDIAT pour éviter l'expiration
+                        let real_urls = self.scrape_download_urls_fast(&full_download_url).await?;
+                        if !real_urls.is_empty() {
+                            info!("✅ URLs de téléchargement réelles trouvées: {:?}", real_urls);
+                            return Ok(Some(real_urls[0].clone())); // Retourner la première URL réelle
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Si pas trouvé avec dlink2, essayer avec href direct
+        let href_selector = Selector::parse("a[href*=\"downloadmp4.php\"]")
+            .map_err(|e| anyhow::anyhow!("Impossible de créer le sélecteur pour href: {}", e))?;
+        
+        for link in document.select(&href_selector) {
+            if let Some(href) = link.value().attr("href") {
+                info!("Href trouvé: {}", href);
+                
+                let full_href_url = if href.starts_with("http") {
+                    href.to_string()
+                } else {
+                    self.resolve_url(href)?
+                };
+                
+                info!("URL complète pour le scraping (href): {}", full_href_url);
+                
+                // Traitement IMMÉDIAT pour éviter l'expiration
+                let real_urls = self.scrape_download_urls_fast(&full_href_url).await?;
+                if !real_urls.is_empty() {
+                    info!("✅ URLs de téléchargement réelles trouvées (href): {:?}", real_urls);
+                    return Ok(Some(real_urls[0].clone()));
+                }
+            }
+        }
+        
+        info!("❌ Aucun lien de téléchargement trouvé pour: {}", episode_url);
+        Ok(None)
+    }
+
+    /// Scrape les liens de téléchargement réels depuis une page episode.php
+    /// Cette fonction navigue vers la page episode.php, puis vers downloadmp4.php, puis extrait les vraies URLs
+    pub async fn scrape_actual_download_link(&self, episode_url: &str) -> Result<Option<String>> {
+        info!("Scraping du lien de téléchargement réel depuis: {}", episode_url);
+        
+        // Construire l'URL complète
+        let full_url = self.resolve_url(episode_url)?;
+        
+        // Ouvrir la page episode.php dans le navigateur pour debug
+        self.open_in_browser(&full_url, "Page Episode");
+        
+        // Récupérer le contenu de la page episode.php
+        let html = self.fetch_page(&full_url).await?;
+        let document = Html::parse_document(&html);
+        
+        // Chercher le div avec class="mainbox3" et le lien avec id="dlink2"
+        let mainbox_selector = Selector::parse("div.mainbox3")
+            .map_err(|e| anyhow::anyhow!("Impossible de créer le sélecteur pour mainbox3: {}", e))?;
+        
+        let link_selector = Selector::parse("a#dlink2")
+            .map_err(|e| anyhow::anyhow!("Impossible de créer le sélecteur pour dlink2: {}", e))?;
+        
+        // Chercher dans les divs mainbox3
+        for mainbox in document.select(&mainbox_selector) {
+            // Chercher le lien dlink2
+            for link in mainbox.select(&link_selector) {
+                if let Some(onclick) = link.value().attr("onclick") {
+                    info!("Onclick trouvé: {}", onclick);
+                    
+                    // Extraire l'URL de window.location.href
+                    let download_url = if let Some(start) = onclick.find("window.location.href=&quot;") {
+                        let start = start + 27; // Longueur de "window.location.href=&quot;"
+                        if let Some(end) = onclick[start..].find("&quot;") {
+                            Some(onclick[start..start + end].to_string())
+                        } else {
+                            None
+                        }
+                    } else if let Some(start) = onclick.find("window.location.href=\"") {
+                        let start = start + 22; // Longueur de "window.location.href=\""
+                        if let Some(end) = onclick[start..].find("\"") {
+                            Some(onclick[start..start + end].to_string())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    
+                    if let Some(url) = download_url {
+                        info!("URL de téléchargement intermédiaire trouvée: {}", url);
+                        
+                        // Construire l'URL complète en combinant avec la base URL
+                        let full_download_url = if url.starts_with("http") {
+                            url
+                        } else {
+                            self.resolve_url(&url)?
+                        };
+                        
+                        info!("URL complète pour le scraping: {}", full_download_url);
+                        
+                        // Ouvrir la page de téléchargement dans le navigateur pour debug
+                        self.open_in_browser(&full_download_url, "Page Download");
+                        
+                        // Maintenant naviguer vers cette page pour obtenir les vraies URLs
+                        let real_urls = self.scrape_download_urls(&full_download_url).await?;
+                        if !real_urls.is_empty() {
+                            info!("URLs de téléchargement réelles trouvées: {:?}", real_urls);
+                            return Ok(Some(real_urls[0].clone())); // Retourner la première URL réelle
                         }
                     }
                 }
@@ -515,7 +1009,19 @@ impl FztvScraper {
                 if let Some(href) = link.value().attr("href") {
                     info!("Href trouvé: {}", href);
                     if href.contains("downloadmp4.php") {
-                        return Ok(Some(href.to_string()));
+                        // Construire l'URL complète
+                        let full_href_url = if href.starts_with("http") {
+                            href.to_string()
+                        } else {
+                            self.resolve_url(href)?
+                        };
+                        
+                        info!("URL complète pour href: {}", full_href_url);
+                        
+                        let real_urls = self.scrape_download_urls(&full_href_url).await?;
+                        if !real_urls.is_empty() {
+                            return Ok(Some(real_urls[0].clone()));
+                        }
                     }
                 }
             }
@@ -566,7 +1072,7 @@ impl FztvScraper {
             .map(|(season_idx, episode_idx, link_idx, url, episode_name)| async move {
                 info!("Scraping du lien pour l'épisode: {}", episode_name);
                 
-                match self.scrape_actual_download_link(&url).await {
+                match self.scrape_actual_download_link_fast(&url).await {
                     Ok(Some(download_url)) => {
                         info!("Lien trouvé pour {}: {}", episode_name, download_url);
                         Some((season_idx, episode_idx, link_idx, download_url))

@@ -7,7 +7,7 @@ edition = "2024"
 anyhow = "1.0"
 futures = "0.3"
 tempfile = "3.23.0"
-tokio = { version = "1.41", features = ["rt-multi-thread", "macros", "fs", "io-util"] }
+tokio = { version = "1.41", features = ["rt-multi-thread", "macros", "fs", "io-util", "process"] }
 reqwest = { version = "0.11", features = ["stream", "gzip", "brotli", "deflate", "cookies", "rustls-tls"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
@@ -17,6 +17,10 @@ toml = "0.8"
 scraper = "0.18"
 select = "0.6"
 url = "2.5"
+webbrowser = "0.8"
+thiserror = "2.0.17"
+chromiumoxide = "0.7.0"
+chromiumoxide_cdp = "0.7.0"
 
 [dev-dependencies]
 hyper = { version = "0.14", features = ["server", "http1"] }
