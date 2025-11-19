@@ -16,7 +16,14 @@ pub async fn download_with_ffmpeg(
     mut progress_tx: mpsc::Sender<FfmpegProgress>
 ) -> Result<(), DownloadError> {
     let output_path = output_path.as_ref().to_owned();
-    let tmp_path = output_path.with_extension("part");
+    // Préserver l'extension originale pour que ffmpeg puisse détecter le format
+    // Exemple: output.mp4 -> output.mp4.part
+    let tmp_path = {
+        let file_name = output_path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("output");
+        output_path.with_file_name(format!("{}.mp4", file_name))
+    };
 
     let mut attempts = 0usize;
 
@@ -33,7 +40,7 @@ pub async fn download_with_ffmpeg(
                 return Ok(());
             }
             Err(e) => {
-                // si auto_restart activé et tentatives < max, réessayer; sinon retourner l'erreur.
+                // si auto_restart activé et tentatives < max, réessayer ; sinon retourner l'erreur.
                 if opts.auto_restart && attempts < opts.max_restarts {
                     // petit délai exponentiel
                     let backoff = Duration::from_secs(2_u64.saturating_pow(attempts as u32));
@@ -54,8 +61,8 @@ async fn run_ffmpeg_once(
     stall_timeout: Duration,
     progress_tx: &mut mpsc::Sender<FfmpegProgress>
 ) -> Result<(), DownloadError> {
-    // Construire les arguments ffmpeg:
-    // -y écraser, -i entrée, -c copy minimiser le réencodage, -progress pipe:1, -nostats, output.tmp
+    // Construire les arguments ffmpeg :
+    // -y écraser, -i entré, -c copy minimiser le réencodage –progress pipe :1, -nostats, output.tmp
     let mut cmd = Command::new("ffmpeg");
     let output_str = tmp_path.to_str()
         .ok_or_else(|| DownloadError::Other("chemin de sortie invalide (UTF-8 requis)".into()))?;
@@ -109,7 +116,7 @@ async fn run_ffmpeg_once(
                     Ok(Some(line)) => {
                         let line = line.trim().to_string();
                         if line.is_empty() {
-                            // ligne vide => limite de paquet de progression; émettre si on a quelque chose
+                            // ligne vide → limite de paquet de progression ; émettre si on a quelque chose
                             if !current.is_empty() {
                                 let _ = progress_tx.try_send(FfmpegProgress::new(current.clone()));
                                 current.clear();
@@ -121,10 +128,10 @@ async fn run_ffmpeg_once(
                             let (k, v) = line.split_at(eq);
                             let v = &v[1..];
                             current.insert(k.to_string(), v.to_string());
-                            // émission immédiate de progression pour certaines clés si désiré:
+                            // émission immédiate de progression pour certaines clés si désirée :
                             if k == "out_time_ms" || k == "progress" {
                                 let _ = progress_tx.try_send(FfmpegProgress::new(current.clone()));
-                                // ne pas effacer; continuer à accumuler
+                                // ne pas effacer ; continuer à accumuler
                             }
                         }
                     }
@@ -150,7 +157,7 @@ async fn run_ffmpeg_once(
         }
     }
 
-    // processus enfant terminé; vérifier le statut de sortie
+    // processus enfant terminé ; vérifier le statut de sortie
     let status = child.wait().await.map_err(DownloadError::Io)?;
     if status.success() {
         // émettre la progression finale avec les champs restants
@@ -180,9 +187,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_download_with_invalid_path() {
-        // Test avec un chemin invalide (non-UTF8) - ceci devrait échouer avant même d'appeler ffmpeg
+        // Test avec un chemin invalide (non-UTF8). Ceci devrait échouer avant même d'appeler ffmpeg
         // Note: Sur Windows, les chemins peuvent contenir des caractères non-UTF8
-        // Ce test vérifie que l'erreur est gérée correctement
+        // Ce test vérifie que l'erreur est gérée correctement.
         let temp_dir = TempDir::new().unwrap();
         let output_path = temp_dir.path().join("test_output.mp4");
         
@@ -347,7 +354,7 @@ mod tests {
         
         assert!(result.is_err());
         // Devrait prendre au moins le temps de 2 tentatives + backoffs
-        // Le backoff est: 2^1 = 2s pour la première tentative, 2^2 = 4s pour la seconde
+        // Le backoff est : 2^1 = 2s pour la première tentative, 2^2 = 4s pour la seconde
         // Donc au moins 6 secondes (mais on utilise des timeouts courts dans le test)
         // En pratique, avec des timeouts de 100ms, cela devrait être rapide
         assert!(elapsed < Duration::from_secs(10)); // Vérifier que ça ne prend pas trop de temps
@@ -369,7 +376,7 @@ mod tests {
         fields2.insert("progress".to_string(), "continue".to_string());
         let progress2 = FfmpegProgress::new(fields2);
         
-        // Deuxième envoi devrait échouer car le canal est plein (capacité 1)
+        // Deuxième envoi devrait échouer, car le canal est plein (capacité 1)
         assert!(tx.try_send(progress2).is_err());
         
         // Recevoir le premier message
