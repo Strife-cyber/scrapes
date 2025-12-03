@@ -25,8 +25,7 @@ pub struct DownloadItem {
     pub url: String,
     #[serde(with = "pathbuf_serde")]
     pub output_path: PathBuf,
-    #[serde(skip)]
-    pub status: DownloadStatus,
+    pub status: DownloadStatus, // SÉRIALISÉ pour sauvegarder le statut dans le JSON
     pub progress: f32, // 0.0 à 1.0
     pub speed: Option<u64>, // bytes/s
     pub total_size: Option<u64>, // bytes
@@ -145,26 +144,40 @@ pub struct DownloadsTab {
     history: Arc<Mutex<HashMap<DownloadId, DownloadItem>>>, // Téléchargements terminés
     new_url: String,
     new_path: String,
+    default_download_dir: PathBuf, // Dossier par défaut pour les téléchargements
     next_id: Arc<Mutex<DownloadId>>,
     progress_rx: Option<mpsc::UnboundedReceiver<DownloadProgress>>,
     progress_tx: Option<mpsc::UnboundedSender<DownloadProgress>>,
     ctx: Option<Context>,
     filter: DownloadFilter,
+    path_selection_rx: Option<mpsc::UnboundedReceiver<PathBuf>>, // Canal pour recevoir les sélections de chemin
+    path_selection_tx: Option<mpsc::UnboundedSender<PathBuf>>, // Canal pour envoyer les sélections de chemin
 }
 
 impl Default for DownloadsTab {
     fn default() -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
+        let (path_tx, path_rx) = mpsc::unbounded_channel();
+        
+        // Déterminer le dossier de téléchargement par défaut
+        let default_dir = std::env::var("USERPROFILE")
+            .or_else(|_| std::env::var("HOME"))
+            .map(|home| PathBuf::from(home).join("Downloads"))
+            .unwrap_or_else(|_| PathBuf::from("."));
+        
         let mut tab = Self {
             downloads: Arc::new(Mutex::new(HashMap::new())),
             history: Arc::new(Mutex::new(HashMap::new())),
             new_url: String::new(),
             new_path: String::new(),
+            default_download_dir: default_dir,
             next_id: Arc::new(Mutex::new(0)),
             progress_rx: Some(rx),
             progress_tx: Some(tx),
             ctx: None,
             filter: DownloadFilter::Active,
+            path_selection_rx: Some(path_rx),
+            path_selection_tx: Some(path_tx),
         };
         
         // Charger l'historique au démarrage
@@ -178,6 +191,93 @@ impl DownloadsTab {
     /// Définit le contexte egui pour les mises à jour
     pub fn set_context(&mut self, ctx: Context) {
         self.ctx = Some(ctx);
+    }
+    
+    /// Suggère un nom de fichier basé sur l'URL
+    fn suggest_filename_from_url(&mut self) {
+        if let Ok(url) = url::Url::parse(&self.new_url) {
+            // Essayer d'extraire le nom de fichier de l'URL
+            if let Some(segments) = url.path_segments() {
+                let segments: Vec<_> = segments.collect();
+                if let Some(last_segment) = segments.last() {
+                    // Nettoyer le segment (enlever les paramètres de requête)
+                    let clean_segment = last_segment.split('?').next().unwrap_or(last_segment);
+                    if !clean_segment.is_empty() && clean_segment.contains('.') {
+                        // C'est probablement un nom de fichier
+                        let suggested_path = self.default_download_dir.join(clean_segment);
+                        self.new_path = suggested_path.to_string_lossy().to_string();
+                        return;
+                    }
+                }
+            }
+            
+            // Si pas de nom de fichier dans l'URL, essayer d'extraire depuis les paramètres
+            // ou utiliser le domaine + timestamp
+            if let Some(domain) = url.domain() {
+                // Essayer de trouver une extension dans le path
+                let path = url.path();
+                let extension = if path.contains('.') {
+                    path.rsplit('.').next().unwrap_or("bin")
+                } else {
+                    // Essayer de deviner l'extension depuis le Content-Type ou utiliser "bin"
+                    "bin"
+                };
+                
+                // Utiliser le domaine (nettoyé) + extension
+                let clean_domain = domain.replace('.', "_").replace('-', "_");
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let filename = format!("{}_{}.{}", clean_domain, timestamp, extension);
+                let suggested_path = self.default_download_dir.join(filename);
+                self.new_path = suggested_path.to_string_lossy().to_string();
+            }
+        }
+    }
+    
+    /// Ouvre un dialogue pour sélectionner le fichier de destination
+    fn browse_for_path(&mut self) {
+        let path_tx = self.path_selection_tx.clone();
+        let default_dir = self.default_download_dir.clone();
+        let suggested_path = if !self.new_path.is_empty() {
+            PathBuf::from(&self.new_path)
+        } else {
+            default_dir.clone()
+        };
+        
+        // Lancer le dialogue dans un thread séparé pour ne pas bloquer l'UI
+        std::thread::spawn(move || {
+            // Extraire le nom de fichier suggéré si disponible
+            let file_name = suggested_path.file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_string());
+            
+            let dialog = rfd::FileDialog::new()
+                .set_directory(&default_dir);
+            
+            let dialog = if let Some(name) = file_name {
+                dialog.set_file_name(&name)
+            } else {
+                dialog
+            };
+            
+            if let Some(path) = dialog.save_file() {
+                // Envoyer le chemin sélectionné via le canal
+                if let Some(tx) = path_tx {
+                    let _ = tx.send(path);
+                }
+            }
+        });
+    }
+    
+    /// Traite les sélections de chemin depuis le dialogue de fichier
+    fn process_path_selections(&mut self) {
+        if let Some(ref mut rx) = self.path_selection_rx {
+            while let Ok(path) = rx.try_recv() {
+                self.new_path = path.to_string_lossy().to_string();
+            }
+        }
     }
     
     /// Traite les messages de progression reçus (non-bloquant pour le thread UI)
@@ -217,7 +317,10 @@ impl DownloadsTab {
                                     self.downloads.try_lock(),
                                     self.history.try_lock(),
                                 ) {
-                                    if let Some(completed) = downloads.remove(&id) {
+                                    if let Some(mut completed) = downloads.remove(&id) {
+                                        // S'assurer que le statut est bien Completed
+                                        completed.status = DownloadStatus::Completed;
+                                        completed.progress = 1.0;
                                         history.insert(id, completed);
                                         needs_save = true;
                                     }
@@ -260,6 +363,8 @@ impl DownloadsTab {
     pub fn show(&mut self, ui: &mut Ui) {
         // Traiter les mises à jour de progression
         self.process_progress_updates();
+        // Traiter les sélections de chemin depuis le dialogue de fichier
+        self.process_path_selections();
         ui.vertical(|ui| {
             // En-tête avec statistiques
             ui.horizontal(|ui| {
@@ -285,17 +390,34 @@ impl DownloadsTab {
                     
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("URL:").strong());
-                        ui.text_edit_singleline(&mut self.new_url)
+                        let url_edit = ui.text_edit_singleline(&mut self.new_url)
                             .on_hover_text("URL du fichier à télécharger");
+                        
+                        // Si l'URL change, suggérer automatiquement le nom de fichier
+                        if url_edit.changed() && !self.new_url.is_empty() {
+                            self.suggest_filename_from_url();
+                        }
                     });
                     
                     ui.add_space(4.0);
                     
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("Chemin:").strong());
+                        ui.label(RichText::new("Destination:").strong());
                         ui.text_edit_singleline(&mut self.new_path)
-                            .on_hover_text("Chemin de destination (ex: D:\\Videos\\file.mp4)");
+                            .on_hover_text("Chemin complet du fichier de destination");
+                        
+                        // Bouton pour sélectionner un fichier/dossier
+                        if ui.button("📁 Parcourir...").clicked() {
+                            self.browse_for_path();
+                        }
                     });
+                    
+                    // Aide contextuelle
+                    if self.new_path.is_empty() && !self.new_url.is_empty() {
+                        ui.label(RichText::new("💡 Astuce: Le nom de fichier sera suggéré automatiquement depuis l'URL")
+                            .small()
+                            .color(Color32::GRAY));
+                    }
                     
                     ui.add_space(8.0);
                     
@@ -673,20 +795,28 @@ impl DownloadsTab {
             Err(_) => return,
         };
         
-        // Combiner et filtrer
+        // Combiner et filtrer - s'assurer que les téléchargements complétés sont inclus
         let mut items: Vec<_> = downloads.into_iter()
             .filter(|d| !matches!(d.status, DownloadStatus::Cancelled))
             .collect();
+        // Ajouter tous les éléments de l'historique (qui incluent les complétés)
         items.extend(history);
         
         // Écrire dans un thread séparé
         let json = match serde_json::to_string_pretty(&items) {
             Ok(j) => j,
-            Err(_) => return,
+            Err(e) => {
+                tracing::warn!("Erreur lors de la sérialisation de l'historique: {}", e);
+                return;
+            }
         };
         
         std::thread::spawn(move || {
-            let _ = fs::write(HISTORY_FILE, json);
+            if let Err(e) = fs::write(HISTORY_FILE, json) {
+                tracing::warn!("Erreur lors de l'écriture de l'historique: {}", e);
+            } else {
+                tracing::debug!("Historique sauvegardé avec succès");
+            }
         });
     }
     
