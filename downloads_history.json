@@ -1,0 +1,42 @@
+[
+  {
+    "id": 3,
+    "url": "https://download.gimp.org/gimp/v2.10/windows/gimp-2.10.36-setup.exe",
+    "output_path": "D:\\gimp-2.10.36-setup.exe",
+    "progress": 0.5384615,
+    "speed": 769404,
+    "total_size": 320646304,
+    "downloaded": 172655700,
+    "error_message": null
+  },
+  {
+    "id": 1,
+    "url": "http://9ubmmwl6kv.y9a8ua48mhss5ye.cyou/rlink_t/432ca7c011673093e49aa5bfc7f33306/c28d75b4142b6e057fa613cb532c59cc/9cd23ba0cc4bdf9074a55b24b567f6fc/White_Collar_-_S2_-_E1_f8cca035e233d58d7e63b8a7e8fd12a8.mp4",
+    "output_path": "D:\\Shows\\White collar\\White_Collar_-_S2_-_E1_f8cca035e233d58d7e63b8a7e8fd12a8.mp4",
+    "progress": 1.0,
+    "speed": null,
+    "total_size": 135956038,
+    "downloaded": 135956038,
+    "error_message": null
+  },
+  {
+    "id": 2,
+    "url": "https://download.gimp.org/gimp/v2.10/windows/gimp-2.10.36-setup.exe",
+    "output_path": "D:\\",
+    "progress": 0.0,
+    "speed": null,
+    "total_size": 320646304,
+    "downloaded": 0,
+    "error_message": "chunk 0: The system cannot find the path specified. (os error 3)"
+  },
+  {
+    "id": 4,
+    "url": "http://9ubmmwl6kv.y9a8ua48mhss5ye.cyou/rlink_t/432ca7c011673093e49aa5bfc7f33306/c28d75b4142b6e057fa613cb532c59cc/9cd23ba0cc4bdf9074a55b24b567f6fc/White_Collar_-_S2_-_E2_ac2278b210d39f13b8696932bf10e9f9.mp4",
+    "output_path": "D:\\Shows\\White collar\\White_Collar_-_S2_-_E2_ac2278b210d39f13b8696932bf10e9f9.mp4",
+    "progress": 0.0,
+    "speed": null,
+    "total_size": 119784269,
+    "downloaded": 0,
+    "error_message": null
+  }
+]

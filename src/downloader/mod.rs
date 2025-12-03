@@ -20,8 +20,9 @@
 mod types;
 mod utils;
 mod manager;
-use manager::DownloadManager;
-use types::DownloadTask;
+
+pub use manager::DownloadManager;
+pub use types::DownloadTask;
 use std::path::PathBuf;
 use std::fs;
 use serde::Deserialize;
