@@ -5,9 +5,12 @@
 //! - Suivre la progression en temps réel
 //! - Gérer les options de redémarrage et timeout
 
-use egui::{Ui, RichText, Color32};
-use std::sync::Arc;
+use egui::{Ui, RichText, Color32, ProgressBar};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use tokio::sync::Mutex;
+use std::path::PathBuf;
+use crate::ffmpeg::{self, DownloadOptions, FfmpegProgress};
+use std::time::Duration;
 
 /// Onglet FFmpeg
 pub struct FfmpegTab {
@@ -17,11 +20,15 @@ pub struct FfmpegTab {
     max_restarts: u32,
     auto_restart: bool,
     is_downloading: bool,
-    progress: Arc<Mutex<FfmpegProgress>>,
+    cancel_flag: Arc<AtomicBool>,
+    progress: Arc<Mutex<FfmpegProgressUI>>,
+    error_message: Arc<Mutex<Option<String>>>,
+    task_handle: Option<std::thread::JoinHandle<()>>,
 }
 
+// Utiliser le type FfmpegProgress du module ffmpeg mais avec des champs simplifiés pour l'UI
 #[derive(Clone, Debug, Default)]
-struct FfmpegProgress {
+struct FfmpegProgressUI {
     out_time_ms: Option<String>,
     bitrate: Option<String>,
     speed: Option<String>,
@@ -36,7 +43,10 @@ impl Default for FfmpegTab {
             max_restarts: 3,
             auto_restart: true,
             is_downloading: false,
-            progress: Arc::new(Mutex::new(FfmpegProgress::default())),
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            progress: Arc::new(Mutex::new(FfmpegProgressUI::default())),
+            error_message: Arc::new(Mutex::new(None)),
+            task_handle: None,
         }
     }
 }
@@ -108,6 +118,10 @@ impl FfmpegTab {
                         }
                         
                         if self.is_downloading {
+                            if ui.button(RichText::new("⏹️ Arrêter").size(14.0).color(Color32::from_rgb(255, 100, 100)))
+                                .clicked() {
+                                self.stop_download();
+                            }
                             ui.spinner();
                             ui.label(RichText::new("Téléchargement en cours...").color(Color32::YELLOW));
                         }
@@ -126,9 +140,20 @@ impl FfmpegTab {
                 .rounding(egui::Rounding::same(6.0))
                 .inner_margin(egui::Margin::same(12.0))
                 .show(ui, |ui| {
-                    let progress_guard = self.progress.blocking_lock();
-                    let progress = progress_guard.clone();
-                    drop(progress_guard);
+                    // Afficher les erreurs (non-bloquant)
+                    if let Ok(error_guard) = self.error_message.try_lock() {
+                        if let Some(ref error) = *error_guard {
+                            ui.label(RichText::new(format!("❌ Erreur: {}", error))
+                                .color(Color32::from_rgb(255, 100, 100)));
+                            ui.add_space(8.0);
+                        }
+                    }
+                    
+                    // Lire la progression (non-bloquant)
+                    let progress = match self.progress.try_lock() {
+                        Ok(guard) => guard.clone(),
+                        Err(_) => FfmpegProgressUI::default(), // Si on ne peut pas acquérir le lock, utiliser des valeurs par défaut
+                    };
                     
                     if self.is_downloading {
                         if let Some(ref time) = progress.out_time_ms {
@@ -154,7 +179,74 @@ impl FfmpegTab {
         }
         
         self.is_downloading = true;
-        // TODO: Intégrer avec le système FFmpeg réel
+        self.cancel_flag.store(false, Ordering::Relaxed);
+        
+        // Réinitialiser les erreurs
+        let error_msg = self.error_message.clone();
+        {
+            let mut guard = error_msg.blocking_lock();
+            *guard = None;
+        }
+        
+        let progress = self.progress.clone();
+        let cancel_flag = self.cancel_flag.clone();
+        let input_url = self.input_url.clone();
+        let output_path = PathBuf::from(&self.output_path);
+        let stall_timeout = Duration::from_secs(self.stall_timeout_secs);
+        let max_restarts = self.max_restarts as usize;
+        let auto_restart = self.auto_restart;
+        
+        // Lancer le téléchargement dans un thread séparé
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
+            rt.block_on(async move {
+                let options = DownloadOptions {
+                    stall_timeout,
+                    auto_restart,
+                    max_restarts,
+                };
+                
+                let progress_clone = progress.clone();
+                let error_msg_clone = error_msg.clone();
+                
+                let result = ffmpeg::download_with_options(
+                    &input_url,
+                    &output_path,
+                    options,
+                    Some(move |prog: &FfmpegProgress| {
+                        let mut guard = progress_clone.blocking_lock();
+                        guard.out_time_ms = prog.fields.get("out_time_ms").cloned();
+                        guard.bitrate = prog.fields.get("bitrate").cloned();
+                        guard.speed = prog.fields.get("speed").cloned();
+                    }),
+                ).await;
+                
+                match result {
+                    Ok(_) => {
+                        // Succès - réinitialiser la progression
+                        let mut guard = progress.blocking_lock();
+                        *guard = FfmpegProgressUI::default();
+                    }
+                    Err(e) => {
+                        let mut guard = error_msg_clone.blocking_lock();
+                        *guard = Some(e.to_string());
+                    }
+                }
+            });
+        });
+        
+        self.task_handle = Some(handle);
+    }
+    
+    fn stop_download(&mut self) {
+        self.cancel_flag.store(true, Ordering::Relaxed);
+        self.is_downloading = false;
+        
+        // Note: FFmpeg ne peut pas être arrêté facilement une fois lancé
+        // On peut améliorer ça en ajoutant un mécanisme d'annulation dans le downloader FFmpeg
+        if let Some(handle) = self.task_handle.take() {
+            let _ = handle.join();
+        }
     }
 }
 

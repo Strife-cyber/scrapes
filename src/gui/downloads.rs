@@ -131,15 +131,25 @@ impl DownloadProgress {
 
 const HISTORY_FILE: &str = "downloads_history.json";
 
+/// Filtre pour afficher les téléchargements
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DownloadFilter {
+    Active,      // En cours, en file, en pause
+    Completed,   // Terminés
+    All,         // Tous
+}
+
 /// Onglet des téléchargements
 pub struct DownloadsTab {
     downloads: Arc<Mutex<HashMap<DownloadId, DownloadItem>>>,
+    history: Arc<Mutex<HashMap<DownloadId, DownloadItem>>>, // Téléchargements terminés
     new_url: String,
     new_path: String,
     next_id: Arc<Mutex<DownloadId>>,
     progress_rx: Option<mpsc::UnboundedReceiver<DownloadProgress>>,
     progress_tx: Option<mpsc::UnboundedSender<DownloadProgress>>,
     ctx: Option<Context>,
+    filter: DownloadFilter,
 }
 
 impl Default for DownloadsTab {
@@ -147,12 +157,14 @@ impl Default for DownloadsTab {
         let (tx, rx) = mpsc::unbounded_channel();
         let mut tab = Self {
             downloads: Arc::new(Mutex::new(HashMap::new())),
+            history: Arc::new(Mutex::new(HashMap::new())),
             new_url: String::new(),
             new_path: String::new(),
             next_id: Arc::new(Mutex::new(0)),
             progress_rx: Some(rx),
             progress_tx: Some(tx),
             ctx: None,
+            filter: DownloadFilter::Active,
         };
         
         // Charger l'historique au démarrage
@@ -168,50 +180,76 @@ impl DownloadsTab {
         self.ctx = Some(ctx);
     }
     
-    /// Traite les messages de progression reçus
+    /// Traite les messages de progression reçus (non-bloquant pour le thread UI)
     fn process_progress_updates(&mut self) {
         if let Some(ref mut rx) = self.progress_rx {
+            let mut needs_save = false;
+            
+            // Traiter tous les messages disponibles sans bloquer
             while let Ok(progress) = rx.try_recv() {
-                let mut downloads = self.downloads.blocking_lock();
-                if let Some(download) = downloads.get_mut(&progress.id()) {
-                    match progress {
-                        DownloadProgress::Started { total_size, .. } => {
-                            download.status = DownloadStatus::Downloading;
-                            download.total_size = Some(total_size);
-                            download.progress = 0.0;
-                        }
-                        DownloadProgress::Progress { downloaded, speed, .. } => {
-                            download.downloaded = downloaded;
-                            download.speed = speed;
-                            if let Some(total) = download.total_size {
-                                download.progress = downloaded as f32 / total as f32;
+                // Utiliser try_lock pour ne pas bloquer le thread UI
+                if let Ok(mut downloads) = self.downloads.try_lock() {
+                    if let Some(download) = downloads.get_mut(&progress.id()) {
+                        match progress {
+                            DownloadProgress::Started { total_size, .. } => {
+                                download.status = DownloadStatus::Downloading;
+                                download.total_size = Some(total_size);
+                                download.progress = 0.0;
+                            }
+                            DownloadProgress::Progress { downloaded, speed, .. } => {
+                                download.downloaded = downloaded;
+                                download.speed = speed;
+                                if let Some(total) = download.total_size {
+                                    download.progress = downloaded as f32 / total as f32;
+                                }
+                            }
+                            DownloadProgress::Merging { .. } => {
+                                download.status = DownloadStatus::Merging;
+                            }
+                            DownloadProgress::Completed { id } => {
+                                download.status = DownloadStatus::Completed;
+                                download.progress = 1.0;
+                                download.speed = None;
+                                
+                                // Déplacer vers l'historique (non-bloquant)
+                                drop(downloads);
+                                if let (Ok(mut downloads), Ok(mut history)) = (
+                                    self.downloads.try_lock(),
+                                    self.history.try_lock(),
+                                ) {
+                                    if let Some(completed) = downloads.remove(&id) {
+                                        history.insert(id, completed);
+                                        needs_save = true;
+                                    }
+                                }
+                                continue; // On a déjà drop downloads, pas besoin de continuer
+                            }
+                            DownloadProgress::Error { error, .. } => {
+                                download.status = DownloadStatus::Error(error.clone());
+                                download.error_message = Some(error);
+                                needs_save = true;
+                            }
+                            DownloadProgress::Paused { .. } => {
+                                download.status = DownloadStatus::Paused;
+                            }
+                            DownloadProgress::Cancelled { .. } => {
+                                download.status = DownloadStatus::Cancelled;
                             }
                         }
-                        DownloadProgress::Merging { .. } => {
-                            download.status = DownloadStatus::Merging;
-                        }
-                        DownloadProgress::Completed { .. } => {
-                            download.status = DownloadStatus::Completed;
-                            download.progress = 1.0;
-                            download.speed = None;
-                        }
-                        DownloadProgress::Error { error, .. } => {
-                            download.status = DownloadStatus::Error(error.clone());
-                            download.error_message = Some(error);
-                        }
-                        DownloadProgress::Paused { .. } => {
-                            download.status = DownloadStatus::Paused;
-                        }
-                        DownloadProgress::Cancelled { .. } => {
-                            download.status = DownloadStatus::Cancelled;
-                        }
+                        needs_save = true;
                     }
+                } else {
+                    // Si on ne peut pas acquérir le lock, on skip ce message
+                    // Il sera traité au prochain frame
+                    break;
                 }
             }
+            
+            // Sauvegarder dans un thread séparé pour ne pas bloquer l'UI
+            if needs_save {
+                self.save_history_async();
+            }
         }
-        
-        // Sauvegarder périodiquement
-        self.save_history();
         
         // Demander un repaint si nécessaire
         if let Some(ref ctx) = self.ctx {
@@ -275,10 +313,12 @@ impl DownloadsTab {
                     
                     // Bouton pour démarrer les téléchargements en file
                     let queued_count = {
-                        let downloads = self.downloads.blocking_lock();
-                        downloads.values()
-                            .filter(|d| matches!(d.status, DownloadStatus::Queued))
-                            .count()
+                        match self.downloads.try_lock() {
+                            Ok(downloads) => downloads.values()
+                                .filter(|d| matches!(d.status, DownloadStatus::Queued))
+                                .count(),
+                            Err(_) => 0, // Si on ne peut pas acquérir le lock, skip
+                        }
                     };
                     
                     if queued_count > 0 {
@@ -293,28 +333,69 @@ impl DownloadsTab {
             
             ui.add_space(12.0);
             
-            // Liste des téléchargements avec scroll
-            ui.heading("📋 Téléchargements");
+            // Filtres et en-tête
+            ui.horizontal(|ui| {
+                ui.heading("📋 Téléchargements");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.selectable_value(&mut self.filter, DownloadFilter::All, "Tous");
+                    ui.selectable_value(&mut self.filter, DownloadFilter::Completed, "Historique");
+                    ui.selectable_value(&mut self.filter, DownloadFilter::Active, "Actifs");
+                });
+            });
             ui.add_space(4.0);
             
             ScrollArea::vertical()
                 .auto_shrink([false; 2])
                 .show(ui, |ui| {
-                    let downloads_guard = self.downloads.blocking_lock();
-                    let mut downloads: Vec<_> = downloads_guard.values().cloned().collect();
-                    drop(downloads_guard);
+                    // Utiliser try_lock pour ne pas bloquer le thread UI
+                    let (active_downloads, history_downloads) = {
+                        match (self.downloads.try_lock(), self.history.try_lock()) {
+                            (Ok(downloads_guard), Ok(history_guard)) => {
+                                let active: Vec<_> = downloads_guard.values().cloned().collect();
+                                let history: Vec<_> = history_guard.values().cloned().collect();
+                                (active, history)
+                            }
+                            _ => {
+                                // Si on ne peut pas acquérir les locks, utiliser des données vides
+                                // Les données seront disponibles au prochain frame
+                                (Vec::new(), Vec::new())
+                            }
+                        }
+                    };
+                    
+                    // Filtrer selon le filtre sélectionné
+                    let mut to_display = Vec::new();
+                    match self.filter {
+                        DownloadFilter::Active => {
+                            to_display = active_downloads;
+                        }
+                        DownloadFilter::Completed => {
+                            to_display = history_downloads;
+                        }
+                        DownloadFilter::All => {
+                            to_display = active_downloads;
+                            to_display.extend(history_downloads);
+                        }
+                    }
                     
                     // Trier par ID (ordre d'ajout)
-                    downloads.sort_by_key(|d| d.id);
+                    to_display.sort_by_key(|d| d.id);
                     
-                    if downloads.is_empty() {
+                    if to_display.is_empty() {
                         ui.vertical_centered(|ui| {
                             ui.add_space(40.0);
-                            ui.label(RichText::new("📭 Aucun téléchargement").size(18.0).color(Color32::GRAY));
-                            ui.label(RichText::new("Ajoutez un téléchargement ci-dessus pour commencer").color(Color32::DARK_GRAY));
+                            let message = match self.filter {
+                                DownloadFilter::Active => "Aucun téléchargement actif",
+                                DownloadFilter::Completed => "Aucun téléchargement dans l'historique",
+                                DownloadFilter::All => "Aucun téléchargement",
+                            };
+                            ui.label(RichText::new(format!("📭 {}", message)).size(18.0).color(Color32::GRAY));
+                            if self.filter == DownloadFilter::Active {
+                                ui.label(RichText::new("Ajoutez un téléchargement ci-dessus pour commencer").color(Color32::DARK_GRAY));
+                            }
                         });
                     } else {
-                        for download in &downloads {
+                        for download in &to_display {
                             self.render_download_item(ui, download);
                             ui.add_space(8.0);
                         }
@@ -354,11 +435,19 @@ impl DownloadsTab {
                                 }
                             }
                             DownloadStatus::Error(_) | DownloadStatus::Cancelled => {
-                                if ui.small_button("🔄").clicked() {
-                                    self.restart_download(download.id);
+                                // Seulement pour les téléchargements actifs, pas l'historique
+                                if matches!(self.filter, DownloadFilter::Active | DownloadFilter::All) {
+                                    if ui.small_button("🔄").clicked() {
+                                        self.restart_download(download.id);
+                                    }
                                 }
                             }
                             _ => {}
+                        }
+                        
+                        // Bouton pour nettoyer les fichiers part (toujours disponible)
+                        if ui.small_button("🗑️").on_hover_text("Nettoyer les fichiers part").clicked() {
+                            self.cleanup_part_files(download.id);
                         }
                     });
                 });
@@ -422,13 +511,21 @@ impl DownloadsTab {
     }
     
     fn get_stats(&self) -> DownloadStats {
-        let downloads = self.downloads.blocking_lock();
+        // Utiliser try_lock pour ne pas bloquer le thread UI
+        let downloads = match self.downloads.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => return DownloadStats { active: 0, completed: 0 },
+        };
+        let history = match self.history.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => return DownloadStats { active: 0, completed: 0 },
+        };
+        
         let active = downloads.values()
             .filter(|d| matches!(d.status, DownloadStatus::Downloading | DownloadStatus::Merging | DownloadStatus::Queued))
             .count();
-        let completed = downloads.values()
-            .filter(|d| matches!(d.status, DownloadStatus::Completed))
-            .count();
+        let completed = history.len();
+        
         DownloadStats { active, completed }
     }
     
@@ -458,134 +555,239 @@ impl DownloadsTab {
             task_handle: Some(Arc::new(Mutex::new(None))),
         };
         
-        let mut downloads = self.downloads.blocking_lock();
-        downloads.insert(id, item);
-        drop(downloads);
+        // Pour l'insertion, utiliser try_lock avec retry si nécessaire
+        let mut retries = 0;
+        loop {
+            match self.downloads.try_lock() {
+                Ok(mut downloads) => {
+                    downloads.insert(id, item);
+                    break;
+                }
+                Err(_) => {
+                    retries += 1;
+                    if retries > 10 {
+                        // Si on ne peut pas acquérir le lock après 10 tentatives, skip
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+        }
         
-        // Sauvegarder l'historique
-        self.save_history();
+        // Sauvegarder l'historique de manière asynchrone
+        self.save_history_async();
         
         // Réinitialiser le formulaire
         self.new_url.clear();
         self.new_path.clear();
     }
     
-    /// Charge l'historique depuis le fichier JSON
+    /// Charge l'historique depuis le fichier JSON (appelé une seule fois au démarrage)
     fn load_history(&mut self) {
-        if let Ok(content) = fs::read_to_string(HISTORY_FILE) {
-            if let Ok(items) = serde_json::from_str::<Vec<DownloadItem>>(&content) {
-                let mut downloads = self.downloads.blocking_lock();
-                let mut max_id = 0;
-                for mut item in items {
-                    // Réinitialiser les champs non-sérialisables
-                    item.cancel_flag = Arc::new(AtomicBool::new(false));
-                    item.task_handle = Some(Arc::new(Mutex::new(None)));
+        // Charger dans un thread séparé pour ne pas bloquer l'UI au démarrage
+        let downloads = self.downloads.clone();
+        let history = self.history.clone();
+        let next_id = self.next_id.clone();
+        
+        std::thread::spawn(move || {
+            if let Ok(content) = fs::read_to_string(HISTORY_FILE) {
+                if let Ok(items) = serde_json::from_str::<Vec<DownloadItem>>(&content) {
+                    let mut downloads_guard = downloads.blocking_lock();
+                    let mut history_guard = history.blocking_lock();
+                    let mut max_id = 0;
                     
-                    // Si le téléchargement était en cours, le remettre en file
-                    if matches!(item.status, DownloadStatus::Downloading | DownloadStatus::Merging) {
-                        item.status = DownloadStatus::Queued;
+                    for mut item in items {
+                        // Réinitialiser les champs non-sérialisables
+                        item.cancel_flag = Arc::new(AtomicBool::new(false));
+                        item.task_handle = Some(Arc::new(Mutex::new(None)));
+                        
+                        max_id = max_id.max(item.id);
+                        
+                        // Séparer les téléchargements actifs de l'historique
+                        if matches!(item.status, DownloadStatus::Completed) {
+                            // Téléchargements terminés -> historique
+                            history_guard.insert(item.id, item);
+                        } else if matches!(item.status, DownloadStatus::Downloading | DownloadStatus::Merging) {
+                            // Téléchargements en cours -> remettre en file
+                            item.status = DownloadStatus::Queued;
+                            downloads_guard.insert(item.id, item);
+                        } else {
+                            // Autres (Queued, Paused, Error, Cancelled) -> actifs
+                            downloads_guard.insert(item.id, item);
+                        }
                     }
+                    drop(downloads_guard);
+                    drop(history_guard);
                     
-                    max_id = max_id.max(item.id);
-                    downloads.insert(item.id, item);
+                    // Mettre à jour le prochain ID
+                    let mut next_id_guard = next_id.blocking_lock();
+                    *next_id_guard = max_id + 1;
                 }
-                drop(downloads);
-                
-                // Mettre à jour le prochain ID
-                let mut next_id = self.next_id.blocking_lock();
-                *next_id = max_id + 1;
             }
-        }
+        });
     }
     
-    /// Sauvegarde l'historique dans le fichier JSON
+    /// Sauvegarde l'historique dans le fichier JSON (version synchrone - à éviter dans le thread UI)
     fn save_history(&self) {
-        let downloads = self.downloads.blocking_lock();
-        let items: Vec<_> = downloads.values()
+        // Utiliser try_lock pour ne pas bloquer
+        let downloads = match self.downloads.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => return, // Si on ne peut pas acquérir le lock, skip
+        };
+        let history = match self.history.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
+        
+        // Combiner actifs et historique, exclure les annulés
+        let mut items: Vec<_> = downloads.values()
             .filter(|d| !matches!(d.status, DownloadStatus::Cancelled))
             .cloned()
             .collect();
-        drop(downloads);
+        items.extend(history.values().cloned());
         
-        if let Ok(json) = serde_json::to_string_pretty(&items) {
+        drop(downloads);
+        drop(history);
+        
+        // Écrire dans un thread séparé pour ne pas bloquer l'UI
+        let json = match serde_json::to_string_pretty(&items) {
+            Ok(j) => j,
+            Err(_) => return,
+        };
+        
+        // Lancer l'écriture dans un thread séparé
+        std::thread::spawn(move || {
             let _ = fs::write(HISTORY_FILE, json);
-        }
+        });
     }
     
-    /// Met en pause un téléchargement
+    /// Sauvegarde asynchrone de l'historique (non-bloquant)
+    fn save_history_async(&self) {
+        // Cloner les données nécessaires
+        let downloads = match self.downloads.try_lock() {
+            Ok(guard) => guard.values().cloned().collect::<Vec<_>>(),
+            Err(_) => return,
+        };
+        let history = match self.history.try_lock() {
+            Ok(guard) => guard.values().cloned().collect::<Vec<_>>(),
+            Err(_) => return,
+        };
+        
+        // Combiner et filtrer
+        let mut items: Vec<_> = downloads.into_iter()
+            .filter(|d| !matches!(d.status, DownloadStatus::Cancelled))
+            .collect();
+        items.extend(history);
+        
+        // Écrire dans un thread séparé
+        let json = match serde_json::to_string_pretty(&items) {
+            Ok(j) => j,
+            Err(_) => return,
+        };
+        
+        std::thread::spawn(move || {
+            let _ = fs::write(HISTORY_FILE, json);
+        });
+    }
+    
+    /// Met en pause un téléchargement (non-bloquant)
     fn pause_download(&mut self, id: DownloadId) {
-        let mut downloads = self.downloads.blocking_lock();
-        if let Some(download) = downloads.get_mut(&id) {
-            download.cancel_flag.store(true, Ordering::Relaxed);
-            download.status = DownloadStatus::Paused;
+        // Utiliser try_lock pour ne pas bloquer le thread UI
+        if let Ok(mut downloads) = self.downloads.try_lock() {
+            if let Some(download) = downloads.get_mut(&id) {
+                download.cancel_flag.store(true, Ordering::Relaxed);
+                download.status = DownloadStatus::Paused;
+            }
         }
-        drop(downloads);
-        self.save_history();
+        
+        // Sauvegarder de manière asynchrone
+        self.save_history_async();
         
         if let Some(tx) = &self.progress_tx {
             let _ = tx.send(DownloadProgress::Paused { id });
         }
     }
     
-    /// Annule un téléchargement
+    /// Annule un téléchargement (non-bloquant)
     fn cancel_download(&mut self, id: DownloadId) {
-        let mut downloads = self.downloads.blocking_lock();
-        if let Some(download) = downloads.get_mut(&id) {
-            download.cancel_flag.store(true, Ordering::Relaxed);
-            download.status = DownloadStatus::Cancelled;
-            
-            // Arrêter la tâche si elle existe
-            if let Some(handle_arc) = &download.task_handle {
-                if let Ok(mut handle_opt) = handle_arc.try_lock() {
-                    if let Some(handle) = handle_opt.take() {
-                        // Note: On ne peut pas vraiment arrêter un thread, mais on peut marquer comme annulé
-                        drop(handle);
+        // Utiliser try_lock pour ne pas bloquer le thread UI
+        if let Ok(mut downloads) = self.downloads.try_lock() {
+            if let Some(download) = downloads.get_mut(&id) {
+                download.cancel_flag.store(true, Ordering::Relaxed);
+                download.status = DownloadStatus::Cancelled;
+                
+                // Arrêter la tâche si elle existe
+                if let Some(handle_arc) = &download.task_handle {
+                    if let Ok(mut handle_opt) = handle_arc.try_lock() {
+                        if let Some(handle) = handle_opt.take() {
+                            // Note: On ne peut pas vraiment arrêter un thread, mais on peut marquer comme annulé
+                            drop(handle);
+                        }
                     }
                 }
             }
         }
-        drop(downloads);
-        self.save_history();
+        
+        // Sauvegarder de manière asynchrone
+        self.save_history_async();
         
         if let Some(tx) = &self.progress_tx {
             let _ = tx.send(DownloadProgress::Cancelled { id });
         }
     }
     
-    /// Reprend un téléchargement en pause
+    /// Reprend un téléchargement en pause (non-bloquant)
     fn resume_download(&mut self, id: DownloadId) {
-        let mut downloads = self.downloads.blocking_lock();
-        let download = downloads.get(&id).cloned();
-        drop(downloads);
-        
-        if let Some(download) = download {
-            if matches!(download.status, DownloadStatus::Paused | DownloadStatus::Queued) {
-                let url = download.url.clone();
-                let output = download.output_path.clone();
-                let tx = self.progress_tx.clone().expect("Progress channel should exist");
-                
-                // Mettre à jour le statut
-        {
-            let downloads = self.downloads.blocking_lock();
-            if let Some(d) = downloads.get(&id) {
-                if !matches!(d.status, DownloadStatus::Paused | DownloadStatus::Queued) {
-                    return;
+        // Vérifier l'état avec try_lock
+        let can_resume = {
+            match self.downloads.try_lock() {
+                Ok(downloads) => {
+                    downloads.get(&id)
+                        .map(|d| matches!(d.status, DownloadStatus::Paused | DownloadStatus::Queued))
+                        .unwrap_or(false)
                 }
-            } else {
-                return;
+                Err(_) => false, // Si on ne peut pas acquérir le lock, skip
             }
+        };
+        
+        if !can_resume {
+            return;
         }
         
-        let mut downloads = self.downloads.blocking_lock();
-        if let Some(d) = downloads.get_mut(&id) {
-            d.status = DownloadStatus::Queued;
-            d.cancel_flag.store(false, Ordering::Relaxed);
-        }
-        drop(downloads);
-                
-                // Relancer le téléchargement
-                std::thread::spawn(move || {
-                    let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
+        // Cloner les données nécessaires
+        let (url, output) = {
+            match self.downloads.try_lock() {
+                Ok(downloads) => {
+                    if let Some(d) = downloads.get(&id) {
+                        (Some(d.url.clone()), Some(d.output_path.clone()))
+                    } else {
+                        (None, None)
+                    }
+                }
+                Err(_) => (None, None),
+            }
+        };
+        
+        if let (Some(url), Some(output)) = (url, output) {
+            let tx = self.progress_tx.clone().expect("Progress channel should exist");
+            
+            // Mettre à jour le statut (non-bloquant)
+            if let Ok(mut downloads) = self.downloads.try_lock() {
+                if let Some(d) = downloads.get_mut(&id) {
+                    d.status = DownloadStatus::Queued;
+                    d.cancel_flag.store(false, Ordering::Relaxed);
+                }
+            }
+            
+            // Relancer le téléchargement avec runtime multi-thread
+            std::thread::Builder::new()
+                .name(format!("download-{}", id))
+                .spawn(move || {
+                    let rt = tokio::runtime::Builder::new_multi_thread()
+                        .worker_threads(4)
+                        .enable_all()
+                        .build()
+                        .expect("Failed to create runtime");
                     rt.block_on(async move {
                         let result = Self::run_download(id, url, output, tx.clone()).await;
                         if let Err(e) = result {
@@ -595,16 +797,25 @@ impl DownloadsTab {
                             });
                         }
                     });
-                });
-            }
+                })
+                .expect("Failed to spawn download thread");
         }
     }
     
     /// Redémarre un téléchargement (après erreur ou annulation)
     fn restart_download(&mut self, id: DownloadId) {
+        // Chercher dans les téléchargements actifs d'abord
         let mut downloads = self.downloads.blocking_lock();
         let download = downloads.get(&id).cloned();
         drop(downloads);
+        
+        // Si pas trouvé dans actifs, chercher dans l'historique
+        let mut download = if let Some(d) = download {
+            Some(d)
+        } else {
+            let mut history = self.history.blocking_lock();
+            history.get(&id).cloned()
+        };
         
         if let Some(mut download) = download {
             // Réinitialiser l'état
@@ -615,31 +826,71 @@ impl DownloadsTab {
             download.cancel_flag = Arc::new(AtomicBool::new(false));
             download.task_handle = Some(Arc::new(Mutex::new(None)));
             
-            // Supprimer les fichiers part existants pour recommencer
-            let output_dir = download.output_path.parent().unwrap_or(std::path::Path::new("."));
-            let output_stem = download.output_path.file_stem().unwrap_or_else(|| std::ffi::OsStr::new("file"));
+            // NE PAS supprimer les fichiers part - ils seront réutilisés pour la reprise
             
-            if let Ok(entries) = std::fs::read_dir(output_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                        if name.starts_with(&format!("{}.part", output_stem.to_string_lossy())) {
-                            let _ = std::fs::remove_file(&path);
-                        }
-                        if name.ends_with(".done") && name.starts_with(&format!("{}.part", output_stem.to_string_lossy())) {
-                            let _ = std::fs::remove_file(&path);
-                        }
-                    }
-                }
-            }
+            // Retirer de l'historique si présent
+            let mut history = self.history.blocking_lock();
+            history.remove(&id);
+            drop(history);
             
-        // Remettre dans la liste
-        let mut downloads = self.downloads.blocking_lock();
-        downloads.insert(id, download);
-        drop(downloads);
+            // Remettre dans la liste active
+            let mut downloads = self.downloads.blocking_lock();
+            downloads.insert(id, download);
+            drop(downloads);
             
             // Démarrer le téléchargement
             self.resume_download(id);
+        }
+    }
+    
+    /// Nettoie manuellement les fichiers part d'un téléchargement (non-bloquant)
+    fn cleanup_part_files(&mut self, id: DownloadId) {
+        // Chercher dans les téléchargements actifs d'abord (non-bloquant)
+        let download = match self.downloads.try_lock() {
+            Ok(downloads) => downloads.get(&id).cloned(),
+            Err(_) => None,
+        };
+        
+        // Si pas trouvé dans actifs, chercher dans l'historique (non-bloquant)
+        let download = if let Some(d) = download {
+            Some(d)
+        } else {
+            match self.history.try_lock() {
+                Ok(history) => history.get(&id).cloned(),
+                Err(_) => None,
+            }
+        };
+        
+        if let Some(download) = download {
+            let output_dir = download.output_path.parent().unwrap_or(std::path::Path::new("."));
+            let output_stem = download.output_path.file_stem().unwrap_or_else(|| std::ffi::OsStr::new("file"));
+            
+            // Effectuer le nettoyage dans un thread séparé pour ne pas bloquer l'UI
+            let output_dir = output_dir.to_path_buf();
+            let output_stem = output_stem.to_string_lossy().to_string();
+            std::thread::spawn(move || {
+                let mut removed_count = 0;
+                if let Ok(entries) = std::fs::read_dir(&output_dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                            // Supprimer les fichiers part
+                            if name.starts_with(&format!("{}.part", output_stem)) && !name.ends_with(".done") {
+                                if std::fs::remove_file(&path).is_ok() {
+                                    removed_count += 1;
+                                }
+                            }
+                            // Supprimer les marqueurs .done
+                            if name.ends_with(".done") && name.starts_with(&format!("{}.part", output_stem)) {
+                                if std::fs::remove_file(&path).is_ok() {
+                                    removed_count += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                tracing::info!("Nettoyé {} fichier(s) part pour le téléchargement {}", removed_count, id);
+            });
         }
     }
     
@@ -665,36 +916,46 @@ impl DownloadsTab {
             let output = download.output_path.clone();
             let tx = progress_tx.clone();
             
-            // Mettre à jour le statut
-            let mut downloads = self.downloads.blocking_lock();
-            if let Some(d) = downloads.get_mut(&id) {
-                d.status = DownloadStatus::Downloading;
+            // Mettre à jour le statut (non-bloquant)
+            if let Ok(mut downloads) = self.downloads.try_lock() {
+                if let Some(d) = downloads.get_mut(&id) {
+                    d.status = DownloadStatus::Downloading;
+                }
             }
-            drop(downloads);
             
-            // Utiliser le runtime tokio global ou créer une nouvelle tâche
-            // Pour egui, on utilise std::thread pour lancer le runtime
+            // Lancer chaque téléchargement dans son propre thread avec son propre runtime tokio
+            // Cela permet un parallélisme illimité - chaque téléchargement est complètement indépendant
             let url_clone = url.clone();
             let output_clone = output.clone();
-            let handle = std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
-                rt.block_on(async move {
-                    let result = Self::run_download(id, url_clone, output_clone, tx.clone()).await;
-                    if let Err(e) = result {
-                        let _ = tx.send(DownloadProgress::Error {
-                            id,
-                            error: e.to_string(),
-                        });
-                    }
-                });
-            });
+            let handle = std::thread::Builder::new()
+                .name(format!("download-{}", id))
+                .spawn(move || {
+                    // Créer un runtime tokio multi-thread pour chaque téléchargement
+                    // Cela permet un vrai parallélisme - chaque téléchargement peut utiliser plusieurs threads
+                    let rt = tokio::runtime::Builder::new_multi_thread()
+                        .worker_threads(4) // 4 threads par téléchargement pour le parallélisme interne
+                        .enable_all()
+                        .build()
+                        .expect("Failed to create runtime");
+                    rt.block_on(async move {
+                        let result = Self::run_download(id, url_clone, output_clone, tx.clone()).await;
+                        if let Err(e) = result {
+                            let _ = tx.send(DownloadProgress::Error {
+                                id,
+                                error: e.to_string(),
+                            });
+                        }
+                    });
+                })
+                .expect("Failed to spawn download thread");
             
-            // Stocker le handle pour pouvoir l'arrêter
-            let mut downloads = self.downloads.blocking_lock();
-            if let Some(d) = downloads.get_mut(&id) {
-                if let Some(handle_arc) = &d.task_handle {
-                    if let Ok(mut handle_opt) = handle_arc.try_lock() {
-                        *handle_opt = Some(handle);
+            // Stocker le handle pour pouvoir l'arrêter (non-bloquant)
+            if let Ok(mut downloads) = self.downloads.try_lock() {
+                if let Some(d) = downloads.get_mut(&id) {
+                    if let Some(handle_arc) = &d.task_handle {
+                        if let Ok(mut handle_opt) = handle_arc.try_lock() {
+                            *handle_opt = Some(handle);
+                        }
                     }
                 }
             }

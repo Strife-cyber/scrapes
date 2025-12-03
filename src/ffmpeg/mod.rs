@@ -1,10 +1,11 @@
 pub mod params;
 pub mod downloader;
 
+pub use params::{DownloadError, DownloadOptions, FfmpegProgress};
+
 use std::path::Path;
 use tokio::sync::mpsc;
 use crate::ffmpeg::downloader::download_with_ffmpeg;
-use crate::ffmpeg::params::{DownloadError, DownloadOptions, FfmpegProgress};
 
 /// Télécharge une URL vers un fichier de sortie avec les options par défaut.
 /// 

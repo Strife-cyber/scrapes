@@ -116,10 +116,11 @@ impl DownloadManager {
         tracing::info!(file = %task.output.display(), parts = part_paths.len(), "Fusion des parties en sortie");
         merge_chunks(&part_paths, &task.output).context("Fusionner chunks")?;
         
-        // Nettoyage des fichiers temporaires
-        self.cleanup_temp_files(&chunks).context("Nettoyer fichiers temporaires")?;
+        // NE PAS nettoyer les fichiers temporaires - les garder pour permettre la reprise
+        // L'utilisateur peut les supprimer manuellement s'il le souhaite
+        // self.cleanup_temp_files(&chunks).context("Nettoyer fichiers temporaires")?;
         
-        tracing::info!(file = %task.output.display(), "Téléchargement terminé");
+        tracing::info!(file = %task.output.display(), "Téléchargement terminé (fichiers part conservés pour reprise)");
         Ok(())
     }
 

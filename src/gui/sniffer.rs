@@ -6,21 +6,19 @@
 //! - Visualiser les requêtes capturées en temps réel
 
 use egui::{Ui, RichText, Color32, ScrollArea};
-use std::sync::Arc;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use tokio::sync::Mutex;
+use crate::sniffers::network_sniffer::{NetworkSniffer, NetworkEntry};
 
 /// Onglet du sniffer réseau
 pub struct SnifferTab {
     target_url: String,
     filter: String,
     is_sniffing: bool,
-    captured_requests: Arc<Mutex<Vec<NetworkRequest>>>,
-}
-
-#[derive(Clone, Debug)]
-struct NetworkRequest {
-    url: String,
-    status: Option<u16>,
+    cancel_flag: Arc<AtomicBool>,
+    captured_requests: Arc<Mutex<Vec<NetworkEntry>>>,
+    error_message: Arc<Mutex<Option<String>>>,
+    task_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Default for SnifferTab {
@@ -29,7 +27,10 @@ impl Default for SnifferTab {
             target_url: String::new(),
             filter: String::new(),
             is_sniffing: false,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
             captured_requests: Arc::new(Mutex::new(Vec::new())),
+            error_message: Arc::new(Mutex::new(None)),
+            task_handle: None,
         }
     }
 }
@@ -74,6 +75,10 @@ impl SnifferTab {
                         }
                         
                         if self.is_sniffing {
+                            if ui.button(RichText::new("⏹️ Arrêter").size(14.0).color(Color32::from_rgb(255, 100, 100)))
+                                .clicked() {
+                                self.stop_sniffing();
+                            }
                             ui.spinner();
                             ui.label(RichText::new("Sniffing en cours...").color(Color32::YELLOW));
                         }
@@ -89,9 +94,20 @@ impl SnifferTab {
             ScrollArea::vertical()
                 .auto_shrink([false; 2])
                 .show(ui, |ui| {
-                    let requests_guard = self.captured_requests.blocking_lock();
-                    let requests = requests_guard.clone();
-                    drop(requests_guard);
+                    // Utiliser try_lock pour ne pas bloquer le thread UI
+                    let requests = match self.captured_requests.try_lock() {
+                        Ok(guard) => guard.clone(),
+                        Err(_) => Vec::new(), // Si on ne peut pas acquérir le lock, utiliser des données vides
+                    };
+                    
+                    // Afficher les erreurs (non-bloquant)
+                    if let Ok(error_guard) = self.error_message.try_lock() {
+                        if let Some(ref error) = *error_guard {
+                            ui.label(RichText::new(format!("❌ Erreur: {}", error))
+                                .color(Color32::from_rgb(255, 100, 100)));
+                            ui.add_space(8.0);
+                        }
+                    }
                     
                     if requests.is_empty() {
                         ui.vertical_centered(|ui| {
@@ -101,9 +117,19 @@ impl SnifferTab {
                                 .color(Color32::DARK_GRAY));
                         });
                     } else {
-                        ui.label(RichText::new(format!("{} requête(s) capturée(s)", requests.len()))
-                            .color(Color32::GRAY)
-                            .small());
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(format!("{} requête(s) capturée(s)", requests.len()))
+                                .color(Color32::GRAY)
+                                .small());
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button("💾 Exporter JSON").clicked() {
+                                    // L'export est déjà fait automatiquement par le sniffer
+                                }
+                                ui.label(RichText::new("(Exporté automatiquement dans network_output.json)")
+                                    .small()
+                                    .color(Color32::GRAY));
+                            });
+                        });
                         ui.add_space(4.0);
                         
                         for (_idx, request) in requests.iter().enumerate() {
@@ -142,7 +168,50 @@ impl SnifferTab {
         }
         
         self.is_sniffing = true;
-        // TODO: Intégrer avec le sniffer réel
+        self.cancel_flag.store(false, Ordering::Relaxed);
+        
+        // Réinitialiser les résultats
+        let results = self.captured_requests.clone();
+        let error_msg = self.error_message.clone();
+        let cancel_flag = self.cancel_flag.clone();
+        let target_url = self.target_url.clone();
+        let filter = if self.filter.is_empty() { None } else { Some(self.filter.clone()) };
+        
+        // Lancer le sniffing dans un thread séparé
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
+            rt.block_on(async move {
+                let sniffer = NetworkSniffer::new(filter);
+                
+                // Note: Le sniffer actuel ne supporte pas l'annulation facilement
+                // On peut améliorer ça plus tard en ajoutant un flag dans NetworkSniffer
+                match sniffer.sniff(&target_url).await {
+                    Ok(_) => {
+                        // Récupérer les résultats
+                        let captured = sniffer.get_results().await;
+                        let mut guard = results.blocking_lock();
+                        *guard = captured;
+                    }
+                    Err(e) => {
+                        let mut guard = error_msg.blocking_lock();
+                        *guard = Some(e.to_string());
+                    }
+                }
+            });
+        });
+        
+        self.task_handle = Some(handle);
+    }
+    
+    fn stop_sniffing(&mut self) {
+        self.cancel_flag.store(true, Ordering::Relaxed);
+        self.is_sniffing = false;
+        
+        // Note: Le sniffer actuel ne peut pas être arrêté facilement
+        // On peut améliorer ça en ajoutant un mécanisme d'annulation dans NetworkSniffer
+        if let Some(handle) = self.task_handle.take() {
+            let _ = handle.join();
+        }
     }
 }
 
