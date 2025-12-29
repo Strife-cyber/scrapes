@@ -5,7 +5,7 @@
 //! - Lancer le scraping des saisons/épisodes
 //! - Visualiser les résultats avec les liens de téléchargement
 
-use egui::{Ui, RichText, Color32, ScrollArea};
+use egui::{Ui, RichText, Color32};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use tokio::sync::Mutex;
 use crate::scrapers::{FztvScraper, Season};

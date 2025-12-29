@@ -935,15 +935,15 @@ impl DownloadsTab {
     /// Redémarre un téléchargement (après erreur ou annulation)
     fn restart_download(&mut self, id: DownloadId) {
         // Chercher dans les téléchargements actifs d'abord
-        let mut downloads = self.downloads.blocking_lock();
+        let downloads = self.downloads.blocking_lock();
         let download = downloads.get(&id).cloned();
         drop(downloads);
         
         // Si pas trouvé dans actifs, chercher dans l'historique
-        let mut download = if let Some(d) = download {
+        let download = if let Some(d) = download {
             Some(d)
         } else {
-            let mut history = self.history.blocking_lock();
+            let history = self.history.blocking_lock();
             history.get(&id).cloned()
         };
         

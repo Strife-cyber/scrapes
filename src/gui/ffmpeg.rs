@@ -15,7 +15,6 @@ use crate::ffmpeg::{self, DownloadOptions, FfmpegProgress};
 use std::time::Duration;
 use serde::{Serialize, Deserialize};
 use std::fs;
-use std::collections::HashSet;
 
 const PATH_HISTORY_FILE: &str = "ffmpeg_paths_history.json";
 
